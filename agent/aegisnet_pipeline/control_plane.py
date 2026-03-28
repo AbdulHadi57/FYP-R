@@ -154,6 +154,27 @@ class NodeControlClient:
             return "wss://" + self.base_url[len("https://") :] + path
         return "ws://" + self.base_url[len("http://") :] + path
 
+    def _ws_path_candidates(self) -> list[str]:
+        if not self.ws_path:
+            return []
+
+        primary = self.ws_path
+        candidates = [primary]
+
+        if primary.startswith("/api/"):
+            candidates.append(primary[len("/api") :])
+        else:
+            candidates.append(f"/api{primary}" if primary.startswith("/") else f"/api/{primary}")
+
+        # Preserve order while removing duplicates.
+        seen = set()
+        unique = []
+        for item in candidates:
+            if item not in seen:
+                seen.add(item)
+                unique.append(item)
+        return unique
+
     def _report_action_status(self, action_id: str, status: str, result: Dict[str, Any]) -> None:
         if not self.auth_token:
             return
@@ -526,8 +547,11 @@ class NodeControlClient:
         if self._websockets_module is None:
             return
 
-        ws_url = self._to_ws_url(f"{self.ws_path}?token={self.auth_token}")
+        ws_paths = self._ws_path_candidates()
+        ws_index = 0
         while not self._stop_event.is_set():
+            ws_path = ws_paths[ws_index]
+            ws_url = self._to_ws_url(f"{ws_path}?token={self.auth_token}")
             try:
                 async with self._websockets_module.connect(ws_url, ping_interval=20, ping_timeout=20) as websocket:
                     await websocket.send(
@@ -549,7 +573,16 @@ class NodeControlClient:
             except asyncio.TimeoutError:
                 continue
             except Exception as exc:
-                self.logger.warning("Control websocket disconnected (%s). Reconnecting in 5s...", exc)
+                exc_text = str(exc)
+                if "404" in exc_text and len(ws_paths) > 1:
+                    ws_index = (ws_index + 1) % len(ws_paths)
+                    self.logger.warning(
+                        "Control websocket path returned 404 (%s). Retrying alternate path %s in 5s...",
+                        exc,
+                        ws_paths[ws_index],
+                    )
+                else:
+                    self.logger.warning("Control websocket disconnected (%s). Reconnecting in 5s...", exc)
                 await asyncio.sleep(5)
 
     def _ws_thread_main(self) -> None:
