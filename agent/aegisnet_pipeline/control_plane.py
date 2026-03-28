@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
+import os
 import platform
+import re
 import shutil
 import socket
 import subprocess
@@ -30,6 +33,10 @@ class ControlPlaneConfig:
     capabilities: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
     response_webhook_url: Optional[str] = None
+    webhook_secret: Optional[str] = None
+    ad_admin_user: Optional[str] = None
+    ad_admin_pass: Optional[str] = None
+    dc_ip: Optional[str] = None
 
 
 class NodeControlClient:
@@ -163,6 +170,202 @@ class NodeControlClient:
         except Exception as exc:
             return {"returncode": 1, "stdout": "", "stderr": str(exc), "command": cmd}
 
+    def _validate_ip(self, ip: str) -> bool:
+        try:
+            ipaddress.ip_address(ip)
+            return True
+        except Exception:
+            return False
+
+    def _fingerprint_os(self, target_ip: str) -> Optional[str]:
+        try:
+            ping_count_flag = "-n" if platform.system().lower() == "windows" else "-c"
+            proc = subprocess.Popen(["ping", ping_count_flag, "1", target_ip], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, _ = proc.communicate(timeout=8)
+            output = stdout.decode("utf-8", errors="ignore")
+
+            ttl_match = re.search(r"TTL=(\d+)|ttl=(\d+)", output, re.IGNORECASE)
+            if not ttl_match:
+                return None
+
+            ttl_value = int(ttl_match.group(1) if ttl_match.group(1) else ttl_match.group(2))
+            if ttl_value <= 64:
+                return "linux"
+            if ttl_value <= 128:
+                return "windows"
+            return "windows"
+        except Exception:
+            return None
+
+    def _get_dc_response_credentials(self) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        admin_user = self.config.ad_admin_user or os.getenv("AEGIS_ADMIN_USER")
+        admin_pass = self.config.ad_admin_pass or os.getenv("AEGIS_ADMIN_PASS")
+        dc_ip = self.config.dc_ip or os.getenv("AEGIS_DC_IP")
+        return admin_user, admin_pass, dc_ip
+
+    def _direct_isolate_windows(self, target_ip: str, admin_user: str, admin_pass: str, dc_ip: Optional[str]) -> tuple[str, Dict[str, Any]]:
+        try:
+            import winrm  # Lazy import so runner can still operate without this dependency until needed.
+        except Exception as exc:
+            return "failed", {"message": f"pywinrm is required for windows isolate/restore: {exc}"}
+
+        try:
+            session = winrm.Session(f"http://{target_ip}:5985/wsman", auth=(admin_user, admin_pass), transport="ntlm")
+            session.run_ps("whoami")
+
+            allow_dc_in = f"New-NetFirewallRule -DisplayName 'AegisNet-Forensic-In' -Direction Inbound -Action Allow -RemoteAddress {dc_ip}" if dc_ip else ""
+            allow_dc_out = f"New-NetFirewallRule -DisplayName 'AegisNet-Forensic-Out' -Direction Outbound -Action Allow -RemoteAddress {dc_ip}" if dc_ip else ""
+            ps_script = f"""
+            {allow_dc_in}
+            {allow_dc_out}
+            Set-NetFirewallProfile -Profile Domain,Public,Private -DefaultInboundAction Block -DefaultOutboundAction Block
+            """
+            result = session.run_ps(ps_script)
+            ok = result.status_code == 0
+            return (
+                "succeeded" if ok else "failed",
+                {
+                    "status_code": result.status_code,
+                    "stdout": (result.std_out or b"").decode("utf-8", errors="ignore").strip(),
+                    "stderr": (result.std_err or b"").decode("utf-8", errors="ignore").strip(),
+                },
+            )
+        except Exception as exc:
+            return "failed", {"message": f"Windows isolate failed: {exc}"}
+
+    def _direct_restore_windows(self, target_ip: str, admin_user: str, admin_pass: str) -> tuple[str, Dict[str, Any]]:
+        try:
+            import winrm
+        except Exception as exc:
+            return "failed", {"message": f"pywinrm is required for windows isolate/restore: {exc}"}
+
+        try:
+            session = winrm.Session(f"http://{target_ip}:5985/wsman", auth=(admin_user, admin_pass), transport="ntlm")
+            check_result = session.run_ps("Get-NetFirewallRule -DisplayName 'AegisNet-Forensic-In' -ErrorAction SilentlyContinue")
+            if not check_result.std_out:
+                return "succeeded", {"message": "restore skipped; host is not currently isolated"}
+
+            ps_script = """
+            Remove-NetFirewallRule -DisplayName 'AegisNet-Forensic-In' -ErrorAction SilentlyContinue
+            Remove-NetFirewallRule -DisplayName 'AegisNet-Forensic-Out' -ErrorAction SilentlyContinue
+            Set-NetFirewallProfile -Profile Domain,Public,Private -DefaultInboundAction Block -DefaultOutboundAction Allow
+            """
+            result = session.run_ps(ps_script)
+            ok = result.status_code == 0
+            return (
+                "succeeded" if ok else "failed",
+                {
+                    "status_code": result.status_code,
+                    "stdout": (result.std_out or b"").decode("utf-8", errors="ignore").strip(),
+                    "stderr": (result.std_err or b"").decode("utf-8", errors="ignore").strip(),
+                },
+            )
+        except Exception as exc:
+            return "failed", {"message": f"Windows restore failed: {exc}"}
+
+    def _direct_isolate_linux(self, target_ip: str, admin_user: str, admin_pass: str, dc_ip: Optional[str]) -> tuple[str, Dict[str, Any]]:
+        try:
+            import paramiko  # Lazy import so non-linux response paths still run.
+        except Exception as exc:
+            return "failed", {"message": f"paramiko is required for linux isolate/restore: {exc}"}
+
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(hostname=target_ip, username=admin_user, password=admin_pass, timeout=10)
+
+            commands = []
+            if dc_ip:
+                commands.extend([
+                    f"sudo iptables -I INPUT 1 -s {dc_ip} -j ACCEPT -m comment --comment 'AegisNet-Allow-DC-In'",
+                    f"sudo iptables -I OUTPUT 1 -d {dc_ip} -j ACCEPT -m comment --comment 'AegisNet-Allow-DC-Out'",
+                ])
+            commands.extend([
+                "sudo iptables -A INPUT -j DROP -m comment --comment 'AegisNet-Isolate-In'",
+                "sudo iptables -A OUTPUT -j DROP -m comment --comment 'AegisNet-Isolate-Out'",
+            ])
+            cmd = "\n".join(commands)
+            _, stdout, stderr = ssh.exec_command(cmd)
+            stdout_text = stdout.read().decode("utf-8", errors="ignore").strip()
+            stderr_text = stderr.read().decode("utf-8", errors="ignore").strip()
+            ssh.close()
+
+            ok = stderr_text == ""
+            return "succeeded" if ok else "failed", {"stdout": stdout_text, "stderr": stderr_text}
+        except Exception as exc:
+            return "failed", {"message": f"Linux isolate failed: {exc}"}
+
+    def _direct_restore_linux(self, target_ip: str, admin_user: str, admin_pass: str, dc_ip: Optional[str]) -> tuple[str, Dict[str, Any]]:
+        try:
+            import paramiko
+        except Exception as exc:
+            return "failed", {"message": f"paramiko is required for linux isolate/restore: {exc}"}
+
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(hostname=target_ip, username=admin_user, password=admin_pass, timeout=10)
+
+            _, stdout_check, _ = ssh.exec_command("sudo iptables -S | grep 'AegisNet-Isolate-In'")
+            has_rule = stdout_check.read().decode("utf-8", errors="ignore").strip()
+            if not has_rule:
+                ssh.close()
+                return "succeeded", {"message": "restore skipped; host is not currently isolated"}
+
+            commands = [
+                "sudo iptables -D INPUT -j DROP -m comment --comment 'AegisNet-Isolate-In' 2>/dev/null",
+                "sudo iptables -D OUTPUT -j DROP -m comment --comment 'AegisNet-Isolate-Out' 2>/dev/null",
+            ]
+            if dc_ip:
+                commands.extend([
+                    f"sudo iptables -D INPUT -s {dc_ip} -j ACCEPT -m comment --comment 'AegisNet-Allow-DC-In' 2>/dev/null",
+                    f"sudo iptables -D OUTPUT -d {dc_ip} -j ACCEPT -m comment --comment 'AegisNet-Allow-DC-Out' 2>/dev/null",
+                ])
+
+            cmd = "\n".join(commands)
+            _, stdout, stderr = ssh.exec_command(cmd)
+            stdout_text = stdout.read().decode("utf-8", errors="ignore").strip()
+            stderr_text = stderr.read().decode("utf-8", errors="ignore").strip()
+            ssh.close()
+
+            ok = stderr_text == ""
+            return "succeeded" if ok else "failed", {"stdout": stdout_text, "stderr": stderr_text}
+        except Exception as exc:
+            return "failed", {"message": f"Linux restore failed: {exc}"}
+
+    def _execute_direct_dc_host_response(self, action_type: str, payload: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+        target_ip = str(payload.get("target_ip") or payload.get("ip") or "").strip()
+        if not target_ip:
+            return "failed", {"message": "Missing payload.target_ip"}
+        if not self._validate_ip(target_ip):
+            return "failed", {"message": "Invalid target_ip format"}
+
+        admin_user, admin_pass, dc_ip = self._get_dc_response_credentials()
+        if not admin_user or not admin_pass:
+            return "failed", {
+                "message": (
+                    "Missing AD admin credentials for direct host response. "
+                    "Provide --admin-user/--admin-pass or set AEGIS_ADMIN_USER/AEGIS_ADMIN_PASS."
+                )
+            }
+
+        os_hint = str(payload.get("target_os") or "").strip().lower()
+        os_type = os_hint if os_hint in {"windows", "linux"} else self._fingerprint_os(target_ip)
+        if os_type not in {"windows", "linux"}:
+            return "failed", {"message": "Host unreachable or OS could not be detected"}
+
+        if action_type == "isolate_host":
+            if os_type == "windows":
+                return self._direct_isolate_windows(target_ip, admin_user, admin_pass, dc_ip)
+            return self._direct_isolate_linux(target_ip, admin_user, admin_pass, dc_ip)
+
+        if action_type == "restore_host":
+            if os_type == "windows":
+                return self._direct_restore_windows(target_ip, admin_user, admin_pass)
+            return self._direct_restore_linux(target_ip, admin_user, admin_pass, dc_ip)
+
+        return "failed", {"message": f"Unsupported direct response action: {action_type}"}
+
     def _powershell_bin(self) -> Optional[str]:
         return shutil.which("powershell") or shutil.which("pwsh")
 
@@ -230,23 +433,32 @@ class NodeControlClient:
         if action_type in {"isolate_host", "restore_host"}:
             webhook_url = self.config.response_webhook_url or payload.get("webhook_url")
             target_ip = payload.get("target_ip") or payload.get("ip")
-            if not webhook_url:
-                return "failed", {"message": "Missing response webhook URL in config or payload.webhook_url"}
+
+            # Optional webhook compatibility path. If no webhook URL is configured,
+            # execute response actions directly inside the DC runner process.
+            if webhook_url:
+                mapped_action = "isolate" if action_type == "isolate_host" else "restore"
+                headers = {}
+                secret = self.config.webhook_secret or os.getenv("AEGIS_WEBHOOK_SECRET", "").strip()
+                if secret:
+                    headers["X-Webhook-Secret"] = secret
+                try:
+                    resp = requests.post(
+                        webhook_url,
+                        json={"target_ip": target_ip, "action": mapped_action},
+                        headers=headers,
+                        timeout=30,
+                    )
+                    body = resp.json() if resp.content else {}
+                    ok = resp.status_code < 400 and body.get("status") in {"success", "skipped"}
+                    return ("succeeded" if ok else "failed", {"status_code": resp.status_code, "body": body})
+                except Exception as exc:
+                    return "failed", {"message": f"Webhook request failed: {exc}"}
+
             if not target_ip:
                 return "failed", {"message": "Missing payload.target_ip"}
 
-            mapped_action = "isolate" if action_type == "isolate_host" else "restore"
-            try:
-                resp = requests.post(
-                    webhook_url,
-                    json={"target_ip": target_ip, "action": mapped_action},
-                    timeout=30,
-                )
-                body = resp.json() if resp.content else {}
-                ok = resp.status_code < 400 and body.get("status") in {"success", "skipped"}
-                return ("succeeded" if ok else "failed", {"status_code": resp.status_code, "body": body})
-            except Exception as exc:
-                return "failed", {"message": f"Webhook request failed: {exc}"}
+            return self._execute_direct_dc_host_response(action_type, payload)
 
         ps_bin = self._powershell_bin()
         if not ps_bin:

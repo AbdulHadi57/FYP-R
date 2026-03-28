@@ -88,19 +88,28 @@ Run this on any machine you want to monitor. It acts as a "Thin Client", sending
 
 ---
 
-## 3. Domain Controller Runner (Phase 1/2)
+## 3. Domain Controller Runner (Single Process)
 
 Run this on each AD/DC node so cloud can issue response actions over a persistent channel.
 
 ```bash
 cd /home/kali/FYP-Dashboard/AegisNet-Cloud/agent
-python3 run_dc_runner.py --server http://<cloud-ip>:8000 --domain corp.local --fqdn dc01.corp.local --site HQ
+python3 run_dc_runner.py
 ```
+
+The runner now starts in interactive mode by default and prompts for required fields (server, domain, FQDN, etc.).
 
 The runner will:
 - register the DC (`/api/control/register/dc`)
 - send periodic heartbeat (`/api/control/heartbeat/dc/{id}`)
 - keep an active websocket channel for command dispatch (`/api/control/ws/control/dc/{id}`)
+- execute `isolate_host` / `restore_host` directly in-process when webhook mode is not configured
+
+You can still run non-interactive with explicit flags:
+
+```bash
+python3 run_dc_runner.py --non-interactive --server http://<cloud-ip>:8000 --domain corp.local --fqdn dc01.corp.local --site HQ
+```
 
 ---
 
@@ -150,7 +159,9 @@ curl -X POST http://localhost:8000/api/control/actions/<action_id>/rollback \
 
 ---
 
-## 5. AD-Local Response Webhook (Recommended)
+## 5. AD-Local Response Webhook (Optional Compatibility Mode)
+
+This is optional. Use it only if you want a separate local response microservice instead of direct in-process execution in `run_dc_runner.py`.
 
 Run the response service on the Domain Controller VM, then have the DC runner call it locally.
 
@@ -167,7 +178,7 @@ python3 ad_response_webhook.py
 Start DC runner to use this local webhook:
 
 ```bash
-python3 run_dc_runner.py --server http://<cloud-ip>:8000 --domain aegisnet.local --response-url http://127.0.0.1:5000/webhook
+python3 run_dc_runner.py --non-interactive --server http://<cloud-ip>:8000 --domain aegisnet.local --fqdn dc01.aegisnet.local --response-url http://127.0.0.1:5000/webhook
 ```
 
 Create isolate/restore actions for the DC target:
