@@ -1,36 +1,35 @@
+import os
 import sqlite3
+import threading
 from pathlib import Path
 
-# Adjust path relative to where main.py is run (usually from backend dir or root)
-# Assuming running from root: python -m backend.main
-# Or running from backend: uvicorn main:app
-# Let's assume running from root for simplicity with the existing data folder
-DB_PATH = Path("data/aegisnet_live.db")
+# Database path from env or default relative to CWD.
+DB_PATH = Path(os.getenv("AEGIS_DB_PATH", "data/aegisnet_live.db"))
+
+# Module-level flag so schema init runs exactly once.
+_schema_initialized = False
+_schema_lock = threading.Lock()
+
 
 def get_db_connection():
-    # Try multiple common paths for reliability
-    possible_paths = [
-        DB_PATH,  # backend root
-        Path("../data/aegisnet_live.db"),  # sibling data dir
-        Path("data/aegisnet_live.db"),  # cwd data dir
-        Path("/home/kali/FYP-Dashboard/Aegisnet-Live/data/aegisnet_live.db")  # absolute fallback
-    ]
-    
-    selected_path = None
-    for p in possible_paths:
-        if p.exists():
-            selected_path = p
-            break
-            
-    if not selected_path:
-        # If no DB found, create a new one at default location for safety
-        selected_path = DB_PATH
+    """Return a SQLite connection.  Schema is initialised on first call only."""
+    global _schema_initialized
+
+    selected_path = DB_PATH
+    if not selected_path.exists():
         selected_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     conn = sqlite3.connect(selected_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    _init_schema(conn)
+    conn.execute("PRAGMA journal_mode=WAL")  # Better concurrent-read perf
+
+    if not _schema_initialized:
+        with _schema_lock:
+            if not _schema_initialized:
+                _init_schema(conn)
+                _schema_initialized = True
     return conn
+
 
 def _init_schema(conn):
     """Initialize database schema if not exists."""
@@ -60,7 +59,7 @@ def _init_schema(conn):
             resolution_note TEXT
         )
     """)
-    
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS module_decisions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,6 +83,7 @@ def _init_schema(conn):
             agent_version TEXT,
             domain_fqdn TEXT,
             dc_hint TEXT,
+            dc_id TEXT,
             interfaces_json TEXT,
             capabilities_json TEXT,
             auth_token TEXT NOT NULL,
@@ -106,6 +106,9 @@ def _init_schema(conn):
             runner_version TEXT,
             capabilities_json TEXT,
             auth_token TEXT NOT NULL,
+            approval_status TEXT DEFAULT 'pending',
+            approved_by TEXT,
+            approved_at TEXT,
             status TEXT DEFAULT 'offline',
             last_seen TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -162,12 +165,12 @@ def _init_schema(conn):
     conn.execute("""
         CREATE TABLE IF NOT EXISTS action_audit_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            action_id TEXT NOT NULL,
+            action_id TEXT,
             event_type TEXT NOT NULL,
             actor TEXT,
+            target_info TEXT,
             details_json TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(action_id) REFERENCES action_jobs(id)
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
@@ -209,7 +212,7 @@ def _init_schema(conn):
             'Isolate target host network access via responsible DC runner',
             'isolate_host',
             '{}',
-            1,
+            0,
             1
         )
         """
@@ -236,6 +239,11 @@ def _init_schema(conn):
     _ensure_column(conn, "action_jobs", "rollback_action_type", "TEXT")
     _ensure_column(conn, "action_jobs", "rollback_payload_json", "TEXT")
     _ensure_column(conn, "action_jobs", "rollback_of_action_id", "TEXT")
+    _ensure_column(conn, "domain_controllers", "approval_status", "TEXT DEFAULT 'pending'")
+    _ensure_column(conn, "domain_controllers", "approved_by", "TEXT")
+    _ensure_column(conn, "domain_controllers", "approved_at", "TEXT")
+    _ensure_column(conn, "agents", "dc_id", "TEXT")
+    _ensure_column(conn, "action_audit_logs", "target_info", "TEXT")
     conn.commit()
 
 

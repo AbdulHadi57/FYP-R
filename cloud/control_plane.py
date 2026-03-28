@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 from datetime import UTC, datetime
 from typing import Dict, Optional, Tuple
@@ -30,26 +31,30 @@ from models import (
 HEARTBEAT_INTERVAL_SECONDS = 15
 CONTROL_API_KEY = os.getenv("AEGIS_CONTROL_API_KEY", "").strip()
 
+# Regex for validating IPv4 / IPv6 addresses.
+_IPV4_RE = re.compile(r"^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)$")
+_IPV6_RE = re.compile(r"^[0-9a-fA-F:]+$")
+
 # Action policy keeps command surface explicit and auditable.
 ACTION_POLICY = {
     "agent": {
         "ping": {"approval": False},
         "noop": {"approval": False},
         "log_message": {"approval": False},
-        "block_ip": {"approval": True, "rollback_action": "unblock_ip", "rollback_payload_builder": "same"},
+        "block_ip": {"approval": False, "rollback_action": "unblock_ip", "rollback_payload_builder": "same"},
         "unblock_ip": {"approval": False},
-        "quarantine_host": {"approval": True, "rollback_action": "unquarantine_host", "rollback_payload_builder": "same"},
+        "quarantine_host": {"approval": False, "rollback_action": "unquarantine_host", "rollback_payload_builder": "same"},
         "unquarantine_host": {"approval": False},
     },
     "dc": {
         "ping": {"approval": False},
         "noop": {"approval": False},
         "log_message": {"approval": False},
-        "isolate_host": {"approval": True, "rollback_action": "restore_host", "rollback_payload_builder": "same"},
+        "isolate_host": {"approval": False, "rollback_action": "restore_host", "rollback_payload_builder": "same"},
         "restore_host": {"approval": False},
-        "disable_ad_user": {"approval": True, "rollback_action": "enable_ad_user", "rollback_payload_builder": "same"},
+        "disable_ad_user": {"approval": False, "rollback_action": "enable_ad_user", "rollback_payload_builder": "same"},
         "enable_ad_user": {"approval": False},
-        "disable_ad_computer": {"approval": True, "rollback_action": "enable_ad_computer", "rollback_payload_builder": "same"},
+        "disable_ad_computer": {"approval": False, "rollback_action": "enable_ad_computer", "rollback_payload_builder": "same"},
         "enable_ad_computer": {"approval": False},
     },
 }
@@ -65,6 +70,13 @@ def _new_id(prefix: str) -> str:
 
 def _new_token() -> str:
     return secrets.token_urlsafe(32)
+
+
+def _validate_ip(ip: str) -> bool:
+    """Return True if *ip* looks like a valid IPv4 or IPv6 address."""
+    if not ip or len(ip) > 45:
+        return False
+    return bool(_IPV4_RE.match(ip) or _IPV6_RE.match(ip))
 
 
 def _require_operator_key(x_control_key: Optional[str]) -> None:
@@ -117,13 +129,13 @@ def _validate_node_token(conn, node_type: str, node_id: str, token: str) -> bool
     return bool(row and row["auth_token"] == token)
 
 
-def _audit(conn, action_id: str, event_type: str, actor: str, details: dict):
+def _audit(conn, action_id: str, event_type: str, actor: str, details: dict, target_info: str = None):
     conn.execute(
         """
-        INSERT INTO action_audit_logs (action_id, event_type, actor, details_json, created_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO action_audit_logs (action_id, event_type, actor, target_info, details_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (action_id, event_type, actor, json.dumps(details), _now_iso()),
+        (action_id, event_type, actor, target_info, json.dumps(details), _now_iso()),
     )
 
 
@@ -200,7 +212,8 @@ async def _dispatch_queued_action(action_id: str) -> None:
                 "UPDATE action_jobs SET status = 'dispatched', dispatched_at = ?, updated_at = ? WHERE id = ?",
                 (now, now, action_id),
             )
-            _audit(conn, action_id, "dispatched", "control-plane", {"target": row["target_id"]})
+            _audit(conn, action_id, "dispatched", "control-plane", {"target": row["target_id"]},
+                   target_info=row["target_id"])
             conn.commit()
     finally:
         conn.close()
@@ -246,7 +259,7 @@ def _resolve_dc_for_agent(conn, agent_id: str) -> str:
         SELECT b.dc_id
         FROM agent_dc_bindings b
         JOIN domain_controllers d ON d.id = b.dc_id
-        WHERE b.agent_id = ? AND b.is_active = 1
+        WHERE b.agent_id = ? AND b.is_active = 1 AND d.approval_status = 'approved'
         ORDER BY b.id DESC
         LIMIT 1
         """,
@@ -266,7 +279,7 @@ def _resolve_dc_for_agent(conn, agent_id: str) -> str:
     dc_hint = (agent_row["dc_hint"] or "").strip()
     if dc_hint:
         hinted = conn.execute(
-            "SELECT id FROM domain_controllers WHERE id = ? OR hostname = ? OR fqdn = ? LIMIT 1",
+            "SELECT id FROM domain_controllers WHERE (id = ? OR hostname = ? OR fqdn = ?) AND approval_status = 'approved' LIMIT 1",
             (dc_hint, dc_hint, dc_hint),
         ).fetchone()
         if hinted:
@@ -279,7 +292,7 @@ def _resolve_dc_for_agent(conn, agent_id: str) -> str:
             """
             SELECT id
             FROM domain_controllers
-            WHERE domain_fqdn = ?
+            WHERE domain_fqdn = ? AND approval_status = 'approved'
             ORDER BY CASE WHEN status = 'online' THEN 0 ELSE 1 END, updated_at DESC
             LIMIT 1
             """,
@@ -288,11 +301,12 @@ def _resolve_dc_for_agent(conn, agent_id: str) -> str:
         if dc:
             return dc["id"]
 
-    # 4) Last resort, choose freshest online DC.
+    # 4) Last resort, choose freshest online approved DC.
     dc = conn.execute(
         """
         SELECT id
         FROM domain_controllers
+        WHERE approval_status = 'approved'
         ORDER BY CASE WHEN status = 'online' THEN 0 ELSE 1 END, updated_at DESC
         LIMIT 1
         """
@@ -300,13 +314,44 @@ def _resolve_dc_for_agent(conn, agent_id: str) -> str:
     if dc:
         return dc["id"]
 
-    raise HTTPException(status_code=409, detail="No domain controller available for this agent")
+    raise HTTPException(status_code=409, detail="No approved domain controller available for this agent")
 
+
+# ─── Registration ────────────────────────────────────────────────────────────
 
 @router.post("/register/agent", response_model=RegistrationResponse)
 def register_agent(request: AgentRegistrationRequest):
     conn = get_db_connection()
     try:
+        # Validate that the agent can register: must have an approved DC
+        dc_hint = (request.dc_hint or "").strip()
+        domain = (request.domain_fqdn or "").strip()
+
+        approved_dc = None
+        if dc_hint:
+            approved_dc = conn.execute(
+                "SELECT id FROM domain_controllers WHERE (id = ? OR hostname = ? OR fqdn = ?) AND approval_status = 'approved' LIMIT 1",
+                (dc_hint, dc_hint, dc_hint),
+            ).fetchone()
+        if not approved_dc and domain:
+            approved_dc = conn.execute(
+                "SELECT id FROM domain_controllers WHERE domain_fqdn = ? AND approval_status = 'approved' LIMIT 1",
+                (domain,),
+            ).fetchone()
+        if not approved_dc:
+            # Try any approved DC as last resort
+            approved_dc = conn.execute(
+                "SELECT id FROM domain_controllers WHERE approval_status = 'approved' LIMIT 1"
+            ).fetchone()
+
+        if not approved_dc:
+            raise HTTPException(
+                status_code=403,
+                detail="No approved domain controller available. A domain controller must be registered and approved before agents can join.",
+            )
+
+        resolved_dc_id = approved_dc["id"]
+
         node_id = request.agent_id or _new_id("agt")
         token_row = conn.execute("SELECT auth_token FROM agents WHERE id = ?", (node_id,)).fetchone()
         auth_token = token_row["auth_token"] if token_row else _new_token()
@@ -315,9 +360,9 @@ def register_agent(request: AgentRegistrationRequest):
         conn.execute(
             """
             INSERT INTO agents (
-                id, hostname, os_type, os_version, agent_version, domain_fqdn, dc_hint,
+                id, hostname, os_type, os_version, agent_version, domain_fqdn, dc_hint, dc_id,
                 interfaces_json, capabilities_json, auth_token, status, last_seen, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'online', ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'online', ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 hostname=excluded.hostname,
                 os_type=excluded.os_type,
@@ -325,6 +370,7 @@ def register_agent(request: AgentRegistrationRequest):
                 agent_version=excluded.agent_version,
                 domain_fqdn=excluded.domain_fqdn,
                 dc_hint=excluded.dc_hint,
+                dc_id=excluded.dc_id,
                 interfaces_json=excluded.interfaces_json,
                 capabilities_json=excluded.capabilities_json,
                 status='online',
@@ -339,6 +385,7 @@ def register_agent(request: AgentRegistrationRequest):
                 request.agent_version,
                 request.domain_fqdn,
                 request.dc_hint,
+                resolved_dc_id,
                 json.dumps(request.interfaces),
                 json.dumps(request.capabilities),
                 auth_token,
@@ -347,20 +394,15 @@ def register_agent(request: AgentRegistrationRequest):
             ),
         )
 
-        if request.dc_hint:
-            dc_row = conn.execute(
-                "SELECT id FROM domain_controllers WHERE id = ? OR hostname = ? OR fqdn = ?",
-                (request.dc_hint, request.dc_hint, request.dc_hint),
-            ).fetchone()
-            if dc_row:
-                conn.execute("UPDATE agent_dc_bindings SET is_active = 0 WHERE agent_id = ?", (node_id,))
-                conn.execute(
-                    """
-                    INSERT INTO agent_dc_bindings (agent_id, dc_id, binding_source, is_active)
-                    VALUES (?, ?, 'agent_hint', 1)
-                    """,
-                    (node_id, dc_row["id"]),
-                )
+        # Update binding
+        conn.execute("UPDATE agent_dc_bindings SET is_active = 0 WHERE agent_id = ?", (node_id,))
+        conn.execute(
+            """
+            INSERT INTO agent_dc_bindings (agent_id, dc_id, binding_source, is_active)
+            VALUES (?, ?, 'auto', 1)
+            """,
+            (node_id, resolved_dc_id),
+        )
 
         conn.commit()
         return RegistrationResponse(
@@ -379,8 +421,10 @@ def register_dc(request: DcRegistrationRequest):
     conn = get_db_connection()
     try:
         node_id = request.dc_id or _new_id("dc")
-        token_row = conn.execute("SELECT auth_token FROM domain_controllers WHERE id = ?", (node_id,)).fetchone()
+        token_row = conn.execute("SELECT auth_token, approval_status FROM domain_controllers WHERE id = ?", (node_id,)).fetchone()
         auth_token = token_row["auth_token"] if token_row else _new_token()
+        # Preserve approval_status on re-registration
+        existing_approval = token_row["approval_status"] if token_row else "pending"
         now = _now_iso()
 
         conn.execute(
@@ -388,8 +432,8 @@ def register_dc(request: DcRegistrationRequest):
             INSERT INTO domain_controllers (
                 id, hostname, fqdn, domain_fqdn, forest_fqdn, site_name,
                 os_version, runner_version, capabilities_json, auth_token,
-                status, last_seen, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'online', ?, ?)
+                approval_status, status, last_seen, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'online', ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 hostname=excluded.hostname,
                 fqdn=excluded.fqdn,
@@ -414,6 +458,7 @@ def register_dc(request: DcRegistrationRequest):
                 request.runner_version,
                 json.dumps(request.capabilities),
                 auth_token,
+                existing_approval,
                 now,
                 now,
             ),
@@ -429,6 +474,81 @@ def register_dc(request: DcRegistrationRequest):
     finally:
         conn.close()
 
+
+# ─── DC Approval ─────────────────────────────────────────────────────────────
+
+@router.post("/dcs/{dc_id}/approve")
+def approve_dc(
+    dc_id: str,
+    approved: bool = True,
+    approved_by: str = "soc_analyst",
+    x_control_key: Optional[str] = Header(default=None, alias="X-Control-Key"),
+):
+    _require_operator_key(x_control_key)
+    conn = get_db_connection()
+    try:
+        row = conn.execute("SELECT id, approval_status FROM domain_controllers WHERE id = ?", (dc_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Domain controller not found")
+
+        now = _now_iso()
+        new_status = "approved" if approved else "rejected"
+        conn.execute(
+            "UPDATE domain_controllers SET approval_status = ?, approved_by = ?, approved_at = ?, updated_at = ? WHERE id = ?",
+            (new_status, approved_by, now, now, dc_id),
+        )
+        _audit(conn, dc_id, f"dc_{new_status}", approved_by,
+               {"dc_id": dc_id, "previous_status": row["approval_status"]},
+               target_info=dc_id)
+        conn.commit()
+        return {"status": "ok", "dc_id": dc_id, "approval_status": new_status}
+    finally:
+        conn.close()
+
+
+@router.delete("/dcs/{dc_id}")
+def delete_dc(
+    dc_id: str,
+    x_control_key: Optional[str] = Header(default=None, alias="X-Control-Key"),
+):
+    """Remove a DC and cascade-remove all agents bound to it."""
+    _require_operator_key(x_control_key)
+    conn = get_db_connection()
+    try:
+        row = conn.execute("SELECT id FROM domain_controllers WHERE id = ?", (dc_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Domain controller not found")
+
+        # Find and remove all agents bound to this DC
+        bound_agents = conn.execute(
+            "SELECT agent_id FROM agent_dc_bindings WHERE dc_id = ? AND is_active = 1", (dc_id,)
+        ).fetchall()
+        agent_ids_removed = []
+        for agent_row in bound_agents:
+            aid = agent_row["agent_id"]
+            agent_ids_removed.append(aid)
+            conn.execute("DELETE FROM agents WHERE id = ?", (aid,))
+            conn.execute("DELETE FROM agent_dc_bindings WHERE agent_id = ?", (aid,))
+
+        # Remove the DC bindings and the DC itself
+        conn.execute("DELETE FROM agent_dc_bindings WHERE dc_id = ?", (dc_id,))
+        conn.execute("DELETE FROM domain_controllers WHERE id = ?", (dc_id,))
+
+        _audit(conn, dc_id, "dc_deleted", "soc_analyst",
+               {"dc_id": dc_id, "cascaded_agents_removed": agent_ids_removed},
+               target_info=dc_id)
+        conn.commit()
+        return {
+            "status": "ok",
+            "dc_id": dc_id,
+            "agents_removed": agent_ids_removed,
+            "message": f"DC {dc_id} and {len(agent_ids_removed)} agent(s) removed",
+        }
+    finally:
+        conn.close()
+
+
+# ─── Heartbeat ───────────────────────────────────────────────────────────────
 
 @router.post("/heartbeat/agent/{agent_id}")
 def heartbeat_agent(agent_id: str, request: HeartbeatRequest):
@@ -474,6 +594,8 @@ def heartbeat_dc(dc_id: str, request: HeartbeatRequest):
         conn.close()
 
 
+# ─── Listing ─────────────────────────────────────────────────────────────────
+
 @router.get("/agents", response_model=list[NodeSummary])
 def list_agents(
     limit: int = 200,
@@ -483,7 +605,7 @@ def list_agents(
     conn = get_db_connection()
     try:
         rows = conn.execute(
-            "SELECT id, hostname, status, last_seen, domain_fqdn FROM agents ORDER BY updated_at DESC LIMIT ?",
+            "SELECT id, hostname, status, last_seen, domain_fqdn, dc_id FROM agents ORDER BY updated_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
         return [NodeSummary(**dict(row)) for row in rows]
@@ -491,7 +613,7 @@ def list_agents(
         conn.close()
 
 
-@router.get("/dcs", response_model=list[NodeSummary])
+@router.get("/dcs")
 def list_dcs(
     limit: int = 200,
     x_control_key: Optional[str] = Header(default=None, alias="X-Control-Key"),
@@ -500,13 +622,25 @@ def list_dcs(
     conn = get_db_connection()
     try:
         rows = conn.execute(
-            "SELECT id, hostname, status, last_seen, domain_fqdn FROM domain_controllers ORDER BY updated_at DESC LIMIT ?",
+            """SELECT id, hostname, status, last_seen, domain_fqdn, approval_status, approved_by, approved_at, fqdn
+               FROM domain_controllers ORDER BY updated_at DESC LIMIT ?""",
             (limit,),
         ).fetchall()
-        return [NodeSummary(**dict(row)) for row in rows]
+        results = []
+        for row in rows:
+            d = dict(row)
+            # Count agents bound to this DC
+            agent_count = conn.execute(
+                "SELECT COUNT(*) FROM agents WHERE dc_id = ?", (d["id"],)
+            ).fetchone()[0]
+            d["agent_count"] = agent_count
+            results.append(d)
+        return results
     finally:
         conn.close()
 
+
+# ─── Response Templates ─────────────────────────────────────────────────────
 
 @router.get("/responses/templates", response_model=list[ResponseTemplateSummary])
 def list_response_templates(
@@ -585,6 +719,11 @@ async def dispatch_template_response(
     x_control_key: Optional[str] = Header(default=None, alias="X-Control-Key"),
 ):
     _require_operator_key(x_control_key)
+
+    # Validate IP
+    if request.target_ip and not _validate_ip(request.target_ip):
+        raise HTTPException(status_code=400, detail="Invalid target IP address format")
+
     conn = get_db_connection()
     try:
         template_row = conn.execute(
@@ -644,6 +783,7 @@ async def dispatch_template_response(
                 "target_port": request.target_port,
                 "protocol": request.protocol,
             },
+            target_info=request.target_ip,
         )
         conn.commit()
     finally:
@@ -657,6 +797,8 @@ async def dispatch_template_response(
     )
 
 
+# ─── Actions ─────────────────────────────────────────────────────────────────
+
 @router.post("/actions", response_model=ActionJobResponse)
 async def create_action(
     request: CreateActionRequest,
@@ -665,6 +807,12 @@ async def create_action(
     _require_operator_key(x_control_key)
     if request.target_type not in {"agent", "dc"}:
         raise HTTPException(status_code=400, detail="target_type must be 'agent' or 'dc'")
+
+    # Validate IPs in payload
+    for ip_key in ("ip", "target_ip"):
+        ip_val = request.payload.get(ip_key, "")
+        if ip_val and not _validate_ip(str(ip_val)):
+            raise HTTPException(status_code=400, detail=f"Invalid IP address in payload.{ip_key}")
 
     action_policy = _policy_for(request.target_type, request.action_type)
     approval_required = bool(action_policy.get("approval", False))
@@ -711,6 +859,8 @@ async def create_action(
                 now,
             ),
         )
+
+        target_ip = request.payload.get("target_ip") or request.payload.get("ip") or ""
         _audit(
             conn,
             action_id,
@@ -722,6 +872,7 @@ async def create_action(
                 "target_id": request.target_id,
                 "approval_required": approval_required,
             },
+            target_info=target_ip,
         )
         conn.commit()
         row = conn.execute("SELECT * FROM action_jobs WHERE id = ?", (action_id,)).fetchone()
@@ -824,8 +975,11 @@ async def rollback_action(
                 now,
             ),
         )
-        _audit(conn, action_id, "rollback_requested", request.requested_by, {"rollback_action_id": rollback_id})
-        _audit(conn, rollback_id, "created", request.requested_by, {"rollback_of": action_id})
+        target_ip = rollback_payload.get("target_ip") or rollback_payload.get("ip") or ""
+        _audit(conn, action_id, "rollback_requested", request.requested_by,
+               {"rollback_action_id": rollback_id}, target_info=target_ip)
+        _audit(conn, rollback_id, "created", request.requested_by,
+               {"rollback_of": action_id}, target_info=target_ip)
         conn.commit()
         rollback_row = conn.execute("SELECT * FROM action_jobs WHERE id = ?", (rollback_id,)).fetchone()
     finally:
@@ -886,7 +1040,7 @@ def get_action_audit(
     try:
         rows = conn.execute(
             """
-            SELECT id, action_id, event_type, actor, details_json, created_at
+            SELECT id, action_id, event_type, actor, target_info, details_json, created_at
             FROM action_audit_logs
             WHERE action_id = ?
             ORDER BY id DESC
@@ -906,6 +1060,54 @@ def get_action_audit(
     finally:
         conn.close()
 
+
+# ─── Unified Audit Trail ────────────────────────────────────────────────────
+
+@router.get("/audit-trail")
+def get_audit_trail(
+    limit: int = 200,
+    action_type: Optional[str] = None,
+    x_control_key: Optional[str] = Header(default=None, alias="X-Control-Key"),
+):
+    """Unified audit trail of all control-plane actions."""
+    _require_operator_key(x_control_key)
+    conn = get_db_connection()
+    try:
+        base_query = """
+            SELECT a.id, a.action_id, a.event_type, a.actor, a.target_info, a.details_json, a.created_at,
+                   j.action_type AS job_action_type, j.target_type AS job_target_type,
+                   j.target_id AS job_target_id, j.status AS job_status, j.payload_json AS job_payload_json
+            FROM action_audit_logs a
+            LEFT JOIN action_jobs j ON a.action_id = j.id
+        """
+        params = []
+
+        if action_type:
+            base_query += " WHERE j.action_type = ?"
+            params.append(action_type)
+
+        base_query += " ORDER BY a.created_at DESC LIMIT ?"
+        params.append(limit)
+
+        rows = conn.execute(base_query, tuple(params)).fetchall()
+        results = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["details"] = json.loads(item.get("details_json") or "{}")
+            except Exception:
+                item["details"] = {}
+            try:
+                item["payload"] = json.loads(item.get("job_payload_json") or "{}")
+            except Exception:
+                item["payload"] = {}
+            results.append(item)
+        return results
+    finally:
+        conn.close()
+
+
+# ─── Action Status Update (from nodes) ──────────────────────────────────────
 
 @router.post("/actions/{action_id}/status", response_model=ActionJobResponse)
 def update_action_status(action_id: str, request: ActionStatusUpdateRequest):
@@ -930,7 +1132,9 @@ def update_action_status(action_id: str, request: ActionStatusUpdateRequest):
             """,
             (request.status, json.dumps(request.result), now, completed_at, action_id),
         )
-        _audit(conn, action_id, "status_update", target_id, {"status": request.status, "result": request.result})
+        _audit(conn, action_id, "status_update", target_id,
+               {"status": request.status, "result": request.result},
+               target_info=target_id)
         conn.commit()
 
         updated = conn.execute("SELECT * FROM action_jobs WHERE id = ?", (action_id,)).fetchone()
@@ -938,6 +1142,8 @@ def update_action_status(action_id: str, request: ActionStatusUpdateRequest):
     finally:
         conn.close()
 
+
+# ─── WebSocket Control Channel ───────────────────────────────────────────────
 
 @router.websocket("/ws/control/{node_type}/{node_id}")
 async def control_ws(websocket: WebSocket, node_type: str, node_id: str, token: str):
@@ -950,6 +1156,12 @@ async def control_ws(websocket: WebSocket, node_type: str, node_id: str, token: 
         if not _validate_node_token(conn, node_type, node_id, token):
             await websocket.close(code=1008)
             return
+        # For DCs, check approval status
+        if node_type == "dc":
+            dc_row = conn.execute("SELECT approval_status FROM domain_controllers WHERE id = ?", (node_id,)).fetchone()
+            if dc_row and dc_row["approval_status"] != "approved":
+                await websocket.close(code=1008, reason="DC not approved")
+                return
     finally:
         conn.close()
 

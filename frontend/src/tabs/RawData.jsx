@@ -124,7 +124,7 @@ export default function RawData({ selectedFlowId }) {
         { id: 'dst_port', label: 'Dst Port' },
         { id: 'protocol', label: 'Protocol' },
         { id: 'ja4_pred', label: 'JA4 Verdict' },
-        { id: 'doh_pred', label: 'DoH Verdict' },
+
         { id: 'apt_pred', label: 'APT Verdict' },
         { id: 'verdict', label: 'Flow Verdict' },
         { id: 'total_packets', label: 'Packet Count' },
@@ -142,7 +142,7 @@ export default function RawData({ selectedFlowId }) {
         { id: 'dst_port', label: 'Dst Port', width: 'w-24' },
         { id: 'protocol', label: 'Proto', width: 'w-20' },
         { id: 'ja4_pred', label: 'JA4', width: 'w-24' },
-        { id: 'doh_pred', label: 'DoH', width: 'w-24' },
+
         { id: 'apt_pred', label: 'APT', width: 'w-24' },
         { id: 'verdict', label: 'Verdict', width: 'w-24' },
         { id: 'confidence', label: 'Conf', width: 'w-20' },
@@ -193,7 +193,7 @@ export default function RawData({ selectedFlowId }) {
 
                         <div className="flex flex-col gap-1 flex-1 min-w-[200px]">
                             <label className="text-xs text-gray-500 uppercase font-bold">Value</label>
-                            {['verdict', 'ja4_pred', 'doh_pred', 'apt_pred'].includes(newFilterCol) ? (
+                            {['verdict', 'ja4_pred', 'apt_pred'].includes(newFilterCol) ? (
                                 <select
                                     className="bg-[#0a0a0a] border border-white/10 rounded px-3 py-2 text-sm text-gray-300 focus:border-primary/50 focus:outline-none w-full"
                                     value={newFilterVal}
@@ -288,7 +288,7 @@ export default function RawData({ selectedFlowId }) {
                                         <span className="bg-white/10 px-1.5 py-0.5 rounded text-[10px] text-gray-300">{getProtoName(flow.protocol)}</span>
                                     </td>
                                     <td className="py-3 font-mono text-xs text-gray-400 capitalize">{flow.ja4_pred !== 'none' ? flow.ja4_pred : '-'}</td>
-                                    <td className="py-3 font-mono text-xs text-gray-400 capitalize">{flow.doh_pred !== 'none' ? flow.doh_pred : '-'}</td>
+
                                     <td className="py-3 font-mono text-xs text-gray-400 capitalize">{flow.apt_pred !== 'none' ? flow.apt_pred : '-'}</td>
                                     <td className="py-3">
                                         <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wide ${flow.verdict === 'malicious' ? 'bg-red-500 text-black shadow-[0_0_10px_rgba(239,68,68,0.4)]' : 'bg-emerald-500/20 text-emerald-400'

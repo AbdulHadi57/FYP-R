@@ -18,6 +18,28 @@ DOMAIN = os.getenv("AEGIS_DOMAIN", "aegisnet.local")
 ADMIN_USER = os.getenv("AEGIS_ADMIN_USER", f"AegisResponseAdmin@{DOMAIN}")
 ADMIN_PASS = os.getenv("AEGIS_ADMIN_PASS", "")
 DC_IP = os.getenv("AEGIS_DC_IP", "10.0.2.10")
+WEBHOOK_SECRET = os.getenv("AEGIS_WEBHOOK_SECRET", "").strip()
+
+# Regex for validating IPv4 / IPv6 addresses before passing to system commands.
+_IPV4_RE = re.compile(r"^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)$")
+_IPV6_RE = re.compile(r"^[0-9a-fA-F:]+$")
+
+
+def _validate_ip(ip: str) -> bool:
+    """Return True if *ip* looks like a valid IPv4 or IPv6 address."""
+    if not ip or len(ip) > 45:
+        return False
+    return bool(_IPV4_RE.match(ip) or _IPV6_RE.match(ip))
+
+
+def _require_webhook_auth():
+    """Check X-Webhook-Secret header when AEGIS_WEBHOOK_SECRET is configured."""
+    if not WEBHOOK_SECRET:
+        return None  # Auth disabled
+    provided = (request.headers.get("X-Webhook-Secret") or "").strip()
+    if provided != WEBHOOK_SECRET:
+        return jsonify({"status": "failed", "message": "Invalid webhook secret"}), 401
+    return None
 
 
 def fingerprint_os(target_ip: str):
@@ -81,11 +103,12 @@ def isolate_linux(target_ip: str) -> str:
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect(hostname=target_ip, username=ADMIN_USER, password=ADMIN_PASS, timeout=10)
 
+        # Add rules with unique comments so we can surgically remove them later.
         isolation_commands = f"""
-        sudo iptables -I INPUT 1 -s {DC_IP} -j ACCEPT
-        sudo iptables -I OUTPUT 1 -d {DC_IP} -j ACCEPT
-        sudo iptables -A INPUT -j DROP
-        sudo iptables -A OUTPUT -j DROP
+        sudo iptables -I INPUT 1 -s {DC_IP} -j ACCEPT -m comment --comment "AegisNet-Allow-DC-In"
+        sudo iptables -I OUTPUT 1 -d {DC_IP} -j ACCEPT -m comment --comment "AegisNet-Allow-DC-Out"
+        sudo iptables -A INPUT -j DROP -m comment --comment "AegisNet-Isolate-In"
+        sudo iptables -A OUTPUT -j DROP -m comment --comment "AegisNet-Isolate-Out"
         """
         ssh.exec_command(isolation_commands)
         ssh.close()
@@ -100,13 +123,21 @@ def restore_linux(target_ip: str) -> str:
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect(hostname=target_ip, username=ADMIN_USER, password=ADMIN_PASS, timeout=10)
 
-        _, stdout, _ = ssh.exec_command("sudo iptables -S | grep '\\-A INPUT \\-j DROP'")
+        # Check if our isolation rules exist before attempting removal.
+        _, stdout, _ = ssh.exec_command("sudo iptables -S | grep 'AegisNet-Isolate-In'")
         rule_exists = stdout.read().decode("utf-8").strip()
         if not rule_exists:
             ssh.close()
             return "not_needed"
 
-        ssh.exec_command("sudo iptables -F")
+        # Only remove AegisNet-specific rules instead of flushing all rules.
+        restore_commands = f"""
+        sudo iptables -D INPUT -j DROP -m comment --comment "AegisNet-Isolate-In" 2>/dev/null
+        sudo iptables -D OUTPUT -j DROP -m comment --comment "AegisNet-Isolate-Out" 2>/dev/null
+        sudo iptables -D INPUT -s {DC_IP} -j ACCEPT -m comment --comment "AegisNet-Allow-DC-In" 2>/dev/null
+        sudo iptables -D OUTPUT -d {DC_IP} -j ACCEPT -m comment --comment "AegisNet-Allow-DC-Out" 2>/dev/null
+        """
+        ssh.exec_command(restore_commands)
         ssh.close()
         return "success"
     except Exception:
@@ -122,6 +153,11 @@ def health():
 
 @app.route("/webhook", methods=["POST"])
 def handle_alert():
+    # Authenticate request
+    auth_err = _require_webhook_auth()
+    if auth_err:
+        return auth_err
+
     data = request.json
     if not data:
         return jsonify({"error": "Invalid payload"}), 400
@@ -129,10 +165,15 @@ def handle_alert():
     if not ADMIN_PASS:
         return jsonify({"status": "failed", "message": "AEGIS_ADMIN_PASS is not configured"}), 500
 
-    target_ip = data.get("target_ip")
+    target_ip = (data.get("target_ip") or "").strip()
     action = (data.get("action") or "").lower()
+
     if not target_ip or action not in {"isolate", "restore"}:
         return jsonify({"status": "failed", "message": "target_ip and action(isolate|restore) required"}), 400
+
+    # Validate IP to prevent command injection
+    if not _validate_ip(target_ip):
+        return jsonify({"status": "failed", "message": "Invalid IP address format"}), 400
 
     current_time = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[AEGISNET COMMAND] {current_time} target={target_ip} action={action}")

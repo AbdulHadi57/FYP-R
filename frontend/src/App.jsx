@@ -1,15 +1,14 @@
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
-import { Shield, LayoutDashboard, Database, Activity, Fingerprint, Lock, ShieldAlert, Siren, SlidersHorizontal } from 'lucide-react';
+import { Shield, LayoutDashboard, Database, Fingerprint, ShieldAlert, SlidersHorizontal, GitBranch, FileText } from 'lucide-react';
 
 import ThreatOverview from './tabs/ThreatOverview';
 import JA4Module from './tabs/modules/JA4Module';
-import DoHModule from './tabs/modules/DoHModule';
 import APTModule from './tabs/modules/APTModule';
-import TrafficForensics from './tabs/TrafficForensics';
 import RawData from './tabs/RawData';
-import EventsTab from './tabs/EventsTab';
 import ControlPlaneTab from './tabs/ControlPlaneTab';
+import DetectionPipeline from './tabs/DetectionPipeline';
+import AuditTrailTab from './tabs/AuditTrailTab';
 
 function App() {
   const [activeTab, setActiveTab] = useState('overview');
@@ -29,10 +28,8 @@ function App() {
         const data = res.data;
 
         if (data.last_flow_timestamp) {
-          // Check if last flow was recent (within 10 seconds)
           const lastTime = new Date(data.last_flow_timestamp).getTime();
           const now = Date.now();
-          // Be generous with the threshold (e.g. 15s) to account for polling
           if (now - lastTime < 15000) {
             setStatus('online');
           } else {
@@ -54,11 +51,10 @@ function App() {
   const renderTab = () => {
     switch (activeTab) {
       case 'overview': return <ThreatOverview />;
+      case 'pipeline': return <DetectionPipeline />;
       case 'ja4': return <JA4Module onNavigateFlow={handleNavigateToFlow} />;
-      case 'doh': return <DoHModule onNavigateFlow={handleNavigateToFlow} />;
       case 'apt': return <APTModule />;
-      case 'forensics': return <TrafficForensics />;
-      case 'events': return <EventsTab apiBaseUrl="" />;
+      case 'audit': return <AuditTrailTab />;
       case 'control': return <ControlPlaneTab />;
       case 'raw': return <RawData selectedFlowId={selectedFlowId} />;
       default: return <ThreatOverview />;
@@ -67,12 +63,11 @@ function App() {
 
   const tabs = [
     { id: 'overview', label: 'Threat Overview', icon: LayoutDashboard },
-    { id: 'events', label: 'Threat Management', icon: Siren },
+    { id: 'pipeline', label: 'Detection Pipeline', icon: GitBranch },
     { id: 'control', label: 'Control Plane', icon: SlidersHorizontal },
+    { id: 'audit', label: 'Audit Trail', icon: FileText },
     { id: 'ja4', label: 'JA4 Fingerprinting', icon: Fingerprint },
-    { id: 'doh', label: 'Encrypted DNS (DoH)', icon: Lock },
     { id: 'apt', label: 'APT Detection', icon: ShieldAlert },
-    { id: 'forensics', label: 'Traffic Forensics', icon: Activity },
     { id: 'raw', label: 'Raw Data Inspector', icon: Database },
   ];
 

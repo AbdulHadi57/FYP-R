@@ -174,6 +174,7 @@ class NodeSummary(BaseModel):
     status: str
     last_seen: Optional[str] = None
     domain_fqdn: Optional[str] = None
+    dc_id: Optional[str] = None
 
 
 class CreateActionRequest(BaseModel):

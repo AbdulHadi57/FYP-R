@@ -1,309 +1,398 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import axios from 'axios';
+import { Shield, Server, Monitor, RefreshCw, CheckCircle2, XCircle, Clock, Trash2, ShieldOff, ShieldCheck, ChevronDown, ChevronRight, FileText, AlertTriangle, Wifi, WifiOff } from 'lucide-react';
 
-const EMPTY_TEMPLATE_FORM = {
-  name: '',
-  description: '',
-  target_action_type: 'isolate_host',
-  default_payload_json: '{}',
-  require_approval: true,
-  enabled: true,
+const API = '';  // Relative, proxied by Vite
+
+const StatusBadge = ({ status }) => {
+  const colors = {
+    online: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40',
+    offline: 'bg-red-500/20 text-red-400 border-red-500/40',
+    pending: 'bg-amber-500/20 text-amber-400 border-amber-500/40',
+    approved: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40',
+    rejected: 'bg-red-500/20 text-red-400 border-red-500/40',
+    queued: 'bg-blue-500/20 text-blue-400 border-blue-500/40',
+    dispatched: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/40',
+    succeeded: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40',
+    failed: 'bg-red-500/20 text-red-400 border-red-500/40',
+    pending_approval: 'bg-amber-500/20 text-amber-400 border-amber-500/40',
+    cancelled: 'bg-gray-500/20 text-gray-400 border-gray-500/40',
+    running: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/40',
+  };
+  return (
+    <span className={`px-2 py-0.5 text-[10px] font-bold uppercase rounded-full border ${colors[status] || 'bg-gray-500/20 text-gray-400 border-gray-500/40'}`}>
+      {status?.replace('_', ' ') || 'unknown'}
+    </span>
+  );
 };
 
-const EMPTY_DISPATCH_FORM = {
-  template_name: '',
-  agent_id: '',
-  target_ip: '',
-  target_port: '',
-  protocol: 'tcp',
-  payload_overrides_json: '{}',
-  requested_by: 'analyst1',
-  reason: 'Automated containment',
-};
+const SectionHeader = ({ icon: Icon, title, count, children }) => (
+  <div className="flex items-center justify-between mb-4">
+    <h3 className="text-lg font-semibold text-gray-100 flex items-center gap-2">
+      <Icon size={20} className="text-cyan-400" />
+      {title}
+      {count !== undefined && <span className="text-sm text-gray-500 font-normal">({count})</span>}
+    </h3>
+    {children}
+  </div>
+);
 
-function parseJsonOrThrow(raw, fieldName) {
-  try {
-    return raw && raw.trim() ? JSON.parse(raw) : {};
-  } catch {
-    throw new Error(`Invalid JSON in ${fieldName}`);
-  }
-}
+// ─── Domain Controllers Section ─────────────────────────────────────────────
+const DomainControllersSection = ({ dcs, onRefresh }) => {
+  const [deleting, setDeleting] = useState(null);
 
-export default function ControlPlaneTab() {
-  const [apiKey, setApiKey] = useState(localStorage.getItem('aegis.controlApiKey') || '');
-  const [agents, setAgents] = useState([]);
-  const [dcs, setDcs] = useState([]);
-  const [templates, setTemplates] = useState([]);
-  const [pendingActions, setPendingActions] = useState([]);
-  const [actions, setActions] = useState([]);
-  const [auditLogs, setAuditLogs] = useState([]);
-  const [selectedActionId, setSelectedActionId] = useState('');
-  const [templateForm, setTemplateForm] = useState(EMPTY_TEMPLATE_FORM);
-  const [dispatchForm, setDispatchForm] = useState(EMPTY_DISPATCH_FORM);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-  const [notice, setNotice] = useState('');
-
-  const requestHeaders = useMemo(() => {
-    if (!apiKey.trim()) {
-      return {};
-    }
-    return { 'X-Control-Key': apiKey.trim() };
-  }, [apiKey]);
-
-  const fetchAll = async () => {
-    setLoading(true);
-    setError('');
+  const handleApprove = async (dcId, approve) => {
     try {
-      const [agentsRes, dcsRes, templatesRes, pendingRes, actionsRes] = await Promise.all([
-        axios.get('/api/control/agents?limit=200', { headers: requestHeaders }),
-        axios.get('/api/control/dcs?limit=200', { headers: requestHeaders }),
-        axios.get('/api/control/responses/templates?enabled_only=false&limit=200', { headers: requestHeaders }),
-        axios.get('/api/control/actions?status=pending_approval&limit=100', { headers: requestHeaders }),
-        axios.get('/api/control/actions?limit=100', { headers: requestHeaders }),
-      ]);
-      setAgents(agentsRes.data || []);
-      setDcs(dcsRes.data || []);
-      setTemplates(templatesRes.data || []);
-      setPendingActions(pendingRes.data || []);
-      setActions(actionsRes.data || []);
-    } catch (err) {
-      setError(err?.response?.data?.detail || err.message || 'Failed to load control-plane data');
+      await axios.post(`${API}/api/control/dcs/${dcId}/approve?approved=${approve}&approved_by=soc_analyst`);
+      onRefresh();
+    } catch (e) {
+      alert(`Failed: ${e.response?.data?.detail || e.message}`);
+    }
+  };
+
+  const handleDelete = async (dcId) => {
+    if (!confirm(`Remove DC ${dcId} and ALL its agents? This cannot be undone.`)) return;
+    setDeleting(dcId);
+    try {
+      await axios.delete(`${API}/api/control/dcs/${dcId}`);
+      onRefresh();
+    } catch (e) {
+      alert(`Failed: ${e.response?.data?.detail || e.message}`);
     } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    fetchAll();
-    const timer = setInterval(fetchAll, 8000);
-    return () => clearInterval(timer);
-  }, [requestHeaders]);
-
-  const submitTemplate = async (e) => {
-    e.preventDefault();
-    setError('');
-    setNotice('');
-    try {
-      const defaultPayload = parseJsonOrThrow(templateForm.default_payload_json, 'template default payload');
-      await axios.post(
-        '/api/control/responses/templates',
-        {
-          name: templateForm.name,
-          description: templateForm.description,
-          target_action_type: templateForm.target_action_type,
-          default_payload: defaultPayload,
-          require_approval: templateForm.require_approval,
-          enabled: templateForm.enabled,
-        },
-        { headers: requestHeaders }
-      );
-      setNotice('Template saved');
-      setTemplateForm(EMPTY_TEMPLATE_FORM);
-      fetchAll();
-    } catch (err) {
-      setError(err?.response?.data?.detail || err.message || 'Template save failed');
-    }
-  };
-
-  const submitDispatch = async (e) => {
-    e.preventDefault();
-    setError('');
-    setNotice('');
-    try {
-      const payloadOverrides = parseJsonOrThrow(dispatchForm.payload_overrides_json, 'dispatch payload overrides');
-      const body = {
-        template_name: dispatchForm.template_name,
-        agent_id: dispatchForm.agent_id,
-        target_ip: dispatchForm.target_ip,
-        protocol: dispatchForm.protocol,
-        payload_overrides: payloadOverrides,
-        requested_by: dispatchForm.requested_by,
-        reason: dispatchForm.reason,
-      };
-      if (dispatchForm.target_port) {
-        body.target_port = Number(dispatchForm.target_port);
-      }
-
-      const res = await axios.post('/api/control/responses/dispatch', body, { headers: requestHeaders });
-      setNotice(`Dispatched to DC ${res.data?.resolved_dc_id || 'unknown'}`);
-      setDispatchForm((prev) => ({ ...EMPTY_DISPATCH_FORM, requested_by: prev.requested_by }));
-      fetchAll();
-    } catch (err) {
-      setError(err?.response?.data?.detail || err.message || 'Template dispatch failed');
-    }
-  };
-
-  const approveAction = async (actionId, approved) => {
-    setError('');
-    setNotice('');
-    const note = approved ? 'Approved from dashboard' : 'Rejected from dashboard';
-    try {
-      await axios.post(
-        `/api/control/actions/${actionId}/approve`,
-        {
-          approved_by: dispatchForm.requested_by || 'analyst1',
-          approved,
-          note,
-        },
-        { headers: requestHeaders }
-      );
-      setNotice(`Action ${approved ? 'approved' : 'rejected'}: ${actionId}`);
-      fetchAll();
-    } catch (err) {
-      setError(err?.response?.data?.detail || err.message || 'Approval update failed');
-    }
-  };
-
-  const loadAudit = async (actionId) => {
-    setSelectedActionId(actionId);
-    setError('');
-    try {
-      const res = await axios.get(`/api/control/actions/${actionId}/audit?limit=100`, { headers: requestHeaders });
-      setAuditLogs(res.data || []);
-    } catch (err) {
-      setError(err?.response?.data?.detail || err.message || 'Failed to load audit logs');
-      setAuditLogs([]);
+      setDeleting(null);
     }
   };
 
   return (
-    <div className="space-y-6">
-      <div className="card p-4 border border-cyan-500/20 bg-black/30">
-        <h2 className="text-lg font-semibold text-cyan-300">Control Plane</h2>
-        <p className="text-xs text-gray-400 mt-1">Manage templates, dispatch responses, and approve actions.</p>
-        <div className="mt-3 grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
-          <div className="p-3 rounded bg-black/40 border border-white/10">Agents: <span className="text-cyan-300">{agents.length}</span></div>
-          <div className="p-3 rounded bg-black/40 border border-white/10">DCs: <span className="text-cyan-300">{dcs.length}</span></div>
-          <div className="p-3 rounded bg-black/40 border border-white/10">Pending approvals: <span className="text-orange-300">{pendingActions.length}</span></div>
+    <div className="rounded-xl border border-white/10 bg-black/20 p-5">
+      <SectionHeader icon={Server} title="Domain Controllers" count={dcs.length}>
+        <button onClick={onRefresh} className="text-xs text-gray-500 hover:text-cyan-400 transition-colors flex items-center gap-1">
+          <RefreshCw size={12} /> Refresh
+        </button>
+      </SectionHeader>
+
+      {dcs.length === 0 ? (
+        <div className="text-center py-8 text-gray-600 text-sm">
+          No domain controllers registered yet. Run <code className="text-cyan-400/60">run_dc_runner.py</code> on your DC to register.
         </div>
-      </div>
+      ) : (
+        <div className="space-y-3">
+          {dcs.map(dc => (
+            <div key={dc.id} className={`rounded-lg border p-4 transition-all ${dc.approval_status === 'pending' ? 'border-amber-500/30 bg-amber-500/5' : 'border-white/5 bg-black/20'}`}>
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <Server size={18} className={dc.status === 'online' ? 'text-emerald-400' : 'text-gray-600'} />
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-medium text-gray-200">{dc.hostname || dc.id}</span>
+                      <StatusBadge status={dc.approval_status} />
+                      <StatusBadge status={dc.status} />
+                    </div>
+                    <div className="text-xs text-gray-500 mt-0.5 flex items-center gap-3">
+                      <span>ID: {dc.id}</span>
+                      {dc.domain_fqdn && <span>Domain: {dc.domain_fqdn}</span>}
+                      {dc.fqdn && <span>FQDN: {dc.fqdn}</span>}
+                      <span>Agents: {dc.agent_count || 0}</span>
+                      {dc.last_seen && <span>Last: {new Date(dc.last_seen).toLocaleString()}</span>}
+                    </div>
+                  </div>
+                </div>
 
-      <div className="card p-4 border border-white/10 bg-black/20">
-        <label className="block text-xs text-gray-400 mb-1">Control API Key (`X-Control-Key`)</label>
-        <div className="flex gap-2">
-          <input
-            className="flex-1 bg-black/50 border border-white/10 rounded px-3 py-2 text-sm"
-            type="password"
-            value={apiKey}
-            onChange={(e) => setApiKey(e.target.value)}
-            placeholder="Optional unless backend sets AEGIS_CONTROL_API_KEY"
-          />
-          <button
-            className="px-4 py-2 rounded bg-cyan-500/20 border border-cyan-500/40 text-cyan-300 text-sm"
-            onClick={() => {
-              localStorage.setItem('aegis.controlApiKey', apiKey);
-              fetchAll();
-            }}
-          >
-            Apply
-          </button>
-        </div>
-      </div>
-
-      {error ? <div className="text-red-300 text-sm">{error}</div> : null}
-      {notice ? <div className="text-emerald-300 text-sm">{notice}</div> : null}
-      {loading ? <div className="text-gray-400 text-sm">Loading control-plane data...</div> : null}
-
-      <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
-        <form onSubmit={submitTemplate} className="card p-4 border border-white/10 bg-black/20 space-y-3">
-          <h3 className="font-semibold text-cyan-300">Template Editor</h3>
-          <input className="w-full bg-black/50 border border-white/10 rounded px-3 py-2 text-sm" placeholder="Template name" value={templateForm.name} onChange={(e) => setTemplateForm((p) => ({ ...p, name: e.target.value }))} required />
-          <input className="w-full bg-black/50 border border-white/10 rounded px-3 py-2 text-sm" placeholder="Description" value={templateForm.description} onChange={(e) => setTemplateForm((p) => ({ ...p, description: e.target.value }))} />
-          <select className="w-full bg-black/50 border border-white/10 rounded px-3 py-2 text-sm" value={templateForm.target_action_type} onChange={(e) => setTemplateForm((p) => ({ ...p, target_action_type: e.target.value }))}>
-            <option value="isolate_host">isolate_host</option>
-            <option value="restore_host">restore_host</option>
-            <option value="disable_ad_user">disable_ad_user</option>
-            <option value="enable_ad_user">enable_ad_user</option>
-            <option value="disable_ad_computer">disable_ad_computer</option>
-            <option value="enable_ad_computer">enable_ad_computer</option>
-          </select>
-          <textarea className="w-full bg-black/50 border border-white/10 rounded px-3 py-2 text-sm font-mono" rows={4} placeholder="Default payload JSON" value={templateForm.default_payload_json} onChange={(e) => setTemplateForm((p) => ({ ...p, default_payload_json: e.target.value }))} />
-          <div className="flex gap-4 text-sm">
-            <label className="flex items-center gap-2"><input type="checkbox" checked={templateForm.require_approval} onChange={(e) => setTemplateForm((p) => ({ ...p, require_approval: e.target.checked }))} />Require approval</label>
-            <label className="flex items-center gap-2"><input type="checkbox" checked={templateForm.enabled} onChange={(e) => setTemplateForm((p) => ({ ...p, enabled: e.target.checked }))} />Enabled</label>
-          </div>
-          <button className="px-4 py-2 rounded bg-cyan-500/20 border border-cyan-500/40 text-cyan-300 text-sm" type="submit">Save Template</button>
-        </form>
-
-        <form onSubmit={submitDispatch} className="card p-4 border border-white/10 bg-black/20 space-y-3">
-          <h3 className="font-semibold text-cyan-300">Dispatch Template</h3>
-          <select className="w-full bg-black/50 border border-white/10 rounded px-3 py-2 text-sm" value={dispatchForm.template_name} onChange={(e) => setDispatchForm((p) => ({ ...p, template_name: e.target.value }))} required>
-            <option value="">Select template</option>
-            {templates.map((tpl) => (
-              <option key={tpl.id} value={tpl.name}>{tpl.name}</option>
-            ))}
-          </select>
-          <input className="w-full bg-black/50 border border-white/10 rounded px-3 py-2 text-sm" placeholder="Agent ID" value={dispatchForm.agent_id} onChange={(e) => setDispatchForm((p) => ({ ...p, agent_id: e.target.value }))} required />
-          <input className="w-full bg-black/50 border border-white/10 rounded px-3 py-2 text-sm" placeholder="Target IP" value={dispatchForm.target_ip} onChange={(e) => setDispatchForm((p) => ({ ...p, target_ip: e.target.value }))} required />
-          <div className="grid grid-cols-2 gap-2">
-            <input className="w-full bg-black/50 border border-white/10 rounded px-3 py-2 text-sm" placeholder="Target Port" value={dispatchForm.target_port} onChange={(e) => setDispatchForm((p) => ({ ...p, target_port: e.target.value }))} />
-            <select className="w-full bg-black/50 border border-white/10 rounded px-3 py-2 text-sm" value={dispatchForm.protocol} onChange={(e) => setDispatchForm((p) => ({ ...p, protocol: e.target.value }))}>
-              <option value="tcp">tcp</option>
-              <option value="udp">udp</option>
-              <option value="any">any</option>
-            </select>
-          </div>
-          <input className="w-full bg-black/50 border border-white/10 rounded px-3 py-2 text-sm" placeholder="Requested by" value={dispatchForm.requested_by} onChange={(e) => setDispatchForm((p) => ({ ...p, requested_by: e.target.value }))} />
-          <input className="w-full bg-black/50 border border-white/10 rounded px-3 py-2 text-sm" placeholder="Reason" value={dispatchForm.reason} onChange={(e) => setDispatchForm((p) => ({ ...p, reason: e.target.value }))} />
-          <textarea className="w-full bg-black/50 border border-white/10 rounded px-3 py-2 text-sm font-mono" rows={3} placeholder="Payload overrides JSON" value={dispatchForm.payload_overrides_json} onChange={(e) => setDispatchForm((p) => ({ ...p, payload_overrides_json: e.target.value }))} />
-          <button className="px-4 py-2 rounded bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 text-sm" type="submit">Dispatch</button>
-        </form>
-      </div>
-
-      <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
-        <div className="card p-4 border border-white/10 bg-black/20">
-          <h3 className="font-semibold text-orange-300 mb-3">Pending Approvals</h3>
-          <div className="space-y-2 max-h-80 overflow-auto">
-            {pendingActions.length === 0 ? <div className="text-sm text-gray-500">No pending actions.</div> : null}
-            {pendingActions.map((action) => (
-              <div key={action.id} className="p-3 rounded border border-white/10 bg-black/40 text-sm">
-                <div className="font-mono text-xs text-gray-400">{action.id}</div>
-                <div className="text-gray-200">{action.action_type} {'->'} {action.target_type}:{action.target_id}</div>
-                <div className="text-gray-400 text-xs">{action.reason || '-'}</div>
-                <div className="mt-2 flex gap-2">
-                  <button className="px-3 py-1 rounded bg-emerald-500/20 border border-emerald-500/30 text-emerald-300 text-xs" onClick={() => approveAction(action.id, true)}>Approve</button>
-                  <button className="px-3 py-1 rounded bg-red-500/20 border border-red-500/30 text-red-300 text-xs" onClick={() => approveAction(action.id, false)}>Reject</button>
-                  <button className="px-3 py-1 rounded bg-cyan-500/20 border border-cyan-500/30 text-cyan-300 text-xs" onClick={() => loadAudit(action.id)}>Audit</button>
+                <div className="flex items-center gap-2">
+                  {dc.approval_status === 'pending' && (
+                    <>
+                      <button onClick={() => handleApprove(dc.id, true)}
+                        className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-medium bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/30 transition-colors">
+                        <CheckCircle2 size={12} /> Approve
+                      </button>
+                      <button onClick={() => handleApprove(dc.id, false)}
+                        className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-medium bg-red-500/20 text-red-400 border border-red-500/30 hover:bg-red-500/30 transition-colors">
+                        <XCircle size={12} /> Reject
+                      </button>
+                    </>
+                  )}
+                  <button onClick={() => handleDelete(dc.id)} disabled={deleting === dc.id}
+                    className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-medium bg-red-500/10 text-red-400/70 border border-red-500/20 hover:bg-red-500/20 transition-colors disabled:opacity-50">
+                    <Trash2 size={12} /> {deleting === dc.id ? 'Removing...' : 'Remove'}
+                  </button>
                 </div>
               </div>
-            ))}
-          </div>
-        </div>
-
-        <div className="card p-4 border border-white/10 bg-black/20">
-          <h3 className="font-semibold text-cyan-300 mb-3">Recent Actions</h3>
-          <div className="space-y-2 max-h-80 overflow-auto">
-            {actions.map((action) => (
-              <div key={action.id} className="p-3 rounded border border-white/10 bg-black/40 text-sm">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="font-mono text-xs text-gray-400">{action.id}</span>
-                  <span className="text-xs text-gray-300">{action.status}</span>
-                </div>
-                <div className="text-gray-200">{action.action_type} {'->'} {action.target_type}:{action.target_id}</div>
-                <button className="mt-2 px-3 py-1 rounded bg-cyan-500/20 border border-cyan-500/30 text-cyan-300 text-xs" onClick={() => loadAudit(action.id)}>View Audit</button>
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
-
-      <div className="card p-4 border border-white/10 bg-black/20">
-        <h3 className="font-semibold text-cyan-300 mb-3">Audit Trail {selectedActionId ? `for ${selectedActionId}` : ''}</h3>
-        <div className="space-y-2 max-h-80 overflow-auto">
-          {auditLogs.length === 0 ? <div className="text-sm text-gray-500">Select an action to load audit entries.</div> : null}
-          {auditLogs.map((item) => (
-            <div key={item.id} className="p-3 rounded border border-white/10 bg-black/40 text-xs">
-              <div className="flex justify-between gap-2 text-gray-300">
-                <span>{item.event_type}</span>
-                <span>{item.created_at}</span>
-              </div>
-              <div className="text-gray-500 mt-1">actor: {item.actor || 'n/a'}</div>
-              <pre className="mt-2 whitespace-pre-wrap text-gray-400 font-mono">{JSON.stringify(item.details || {}, null, 2)}</pre>
             </div>
           ))}
         </div>
+      )}
+    </div>
+  );
+};
+
+// ─── Agent Inventory Section ────────────────────────────────────────────────
+const AgentInventorySection = ({ agents, dcs }) => {
+  const [expandedDc, setExpandedDc] = useState({});
+
+  // Group agents by dc_id
+  const grouped = {};
+  for (const dc of dcs) {
+    grouped[dc.id] = { dc, agents: [] };
+  }
+  // Also add an "unassigned" group
+  grouped['__unassigned__'] = { dc: null, agents: [] };
+
+  for (const agent of agents) {
+    const gKey = agent.dc_id && grouped[agent.dc_id] ? agent.dc_id : '__unassigned__';
+    grouped[gKey].agents.push(agent);
+  }
+
+  const toggleDc = (dcId) => {
+    setExpandedDc(prev => ({ ...prev, [dcId]: !prev[dcId] }));
+  };
+
+  const groups = Object.entries(grouped).filter(([_, v]) => v.agents.length > 0 || v.dc);
+
+  return (
+    <div className="rounded-xl border border-white/10 bg-black/20 p-5">
+      <SectionHeader icon={Monitor} title="Agent Inventory" count={agents.length} />
+
+      {agents.length === 0 ? (
+        <div className="text-center py-8 text-gray-600 text-sm">
+          No agents registered yet. Start <code className="text-cyan-400/60">run_agent.py</code> on endpoints to register.
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {groups.map(([dcId, group]) => {
+            const isExpanded = expandedDc[dcId] !== false; // Default expanded
+            const dcLabel = group.dc ? `${group.dc.hostname || dcId} (${group.dc.domain_fqdn || 'no domain'})` : 'Unassigned Agents';
+            return (
+              <div key={dcId} className="rounded-lg border border-white/5 overflow-hidden">
+                {/* DC group header */}
+                <button onClick={() => toggleDc(dcId)}
+                  className="w-full flex items-center justify-between p-3 bg-black/30 hover:bg-black/40 transition-colors text-left">
+                  <div className="flex items-center gap-2">
+                    {isExpanded ? <ChevronDown size={14} className="text-gray-500" /> : <ChevronRight size={14} className="text-gray-500" />}
+                    <Server size={14} className="text-cyan-400/60" />
+                    <span className="text-sm font-medium text-gray-300">{dcLabel}</span>
+                    <span className="text-xs text-gray-600">({group.agents.length} agent{group.agents.length !== 1 ? 's' : ''})</span>
+                  </div>
+                  {group.dc && <StatusBadge status={group.dc.approval_status} />}
+                </button>
+
+                {/* Agent rows */}
+                {isExpanded && group.agents.length > 0 && (
+                  <div className="divide-y divide-white/5">
+                    {group.agents.map(agent => (
+                      <div key={agent.id} className="flex items-center justify-between px-4 py-2.5 bg-black/10 hover:bg-black/20 transition-colors">
+                        <div className="flex items-center gap-3">
+                          {agent.status === 'online'
+                            ? <Wifi size={14} className="text-emerald-400" />
+                            : <WifiOff size={14} className="text-gray-600" />}
+                          <div>
+                            <span className="text-sm text-gray-300">{agent.hostname || agent.id}</span>
+                            <span className="text-xs text-gray-600 ml-2">{agent.id}</span>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-3">
+                          {agent.domain_fqdn && <span className="text-xs text-gray-500">{agent.domain_fqdn}</span>}
+                          <StatusBadge status={agent.status} />
+                          {agent.last_seen && <span className="text-[10px] text-gray-600">{new Date(agent.last_seen).toLocaleTimeString()}</span>}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ─── Active Response Section ────────────────────────────────────────────────
+const ActiveResponseSection = ({ actions, agents, dcs, onRefresh }) => {
+  const [isolateIp, setIsolateIp] = useState('');
+  const [selectedDc, setSelectedDc] = useState('');
+  const [actionLoading, setActionLoading] = useState(false);
+
+  const approvedDcs = dcs.filter(d => d.approval_status === 'approved');
+
+  const handleAction = async (actionType, targetIp) => {
+    const dcId = selectedDc || (approvedDcs.length > 0 ? approvedDcs[0].id : '');
+    if (!dcId) { alert('No approved DC available'); return; }
+    if (!targetIp) { alert('Enter target IP'); return; }
+    setActionLoading(true);
+    try {
+      await axios.post(`${API}/api/control/actions`, {
+        target_type: 'dc',
+        target_id: dcId,
+        action_type: actionType,
+        payload: { target_ip: targetIp },
+        requested_by: 'soc_analyst',
+        reason: `Manual ${actionType} from dashboard`,
+        require_approval: false,
+      });
+      setIsolateIp('');
+      onRefresh();
+    } catch (e) {
+      alert(`Failed: ${e.response?.data?.detail || e.message}`);
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const handleRollback = async (actionId) => {
+    try {
+      await axios.post(`${API}/api/control/actions/${actionId}/rollback`, {
+        requested_by: 'soc_analyst',
+        reason: 'Manual restore from dashboard',
+      });
+      onRefresh();
+    } catch (e) {
+      alert(`Failed: ${e.response?.data?.detail || e.message}`);
+    }
+  };
+
+  // Filter to response-relevant actions
+  const responseActions = actions.filter(a =>
+    ['isolate_host', 'restore_host', 'block_ip', 'unblock_ip', 'quarantine_host', 'unquarantine_host', 'disable_ad_user', 'enable_ad_user'].includes(a.action_type)
+  );
+
+  return (
+    <div className="rounded-xl border border-white/10 bg-black/20 p-5">
+      <SectionHeader icon={ShieldOff} title="Active Response Controls" count={responseActions.length} />
+
+      {/* Quick Action Bar */}
+      <div className="flex items-center gap-3 mb-5 p-3 rounded-lg bg-black/30 border border-white/5">
+        <input
+          type="text"
+          value={isolateIp}
+          onChange={(e) => setIsolateIp(e.target.value)}
+          placeholder="Target IP address"
+          className="flex-1 bg-black/30 border border-white/10 rounded-lg px-3 py-2 text-sm text-gray-300 placeholder:text-gray-600 focus:border-cyan-500/50 focus:outline-none"
+        />
+        {approvedDcs.length > 1 && (
+          <select value={selectedDc} onChange={(e) => setSelectedDc(e.target.value)}
+            className="bg-black/30 border border-white/10 rounded-lg px-3 py-2 text-sm text-gray-300 focus:border-cyan-500/50 focus:outline-none">
+            <option value="">Auto (first DC)</option>
+            {approvedDcs.map(dc => <option key={dc.id} value={dc.id}>{dc.hostname || dc.id}</option>)}
+          </select>
+        )}
+        <button onClick={() => handleAction('isolate_host', isolateIp)} disabled={actionLoading || !isolateIp}
+          className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium bg-red-500/20 text-red-400 border border-red-500/30 hover:bg-red-500/30 transition-colors disabled:opacity-40">
+          <ShieldOff size={14} /> Isolate
+        </button>
+        <button onClick={() => handleAction('restore_host', isolateIp)} disabled={actionLoading || !isolateIp}
+          className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/30 transition-colors disabled:opacity-40">
+          <ShieldCheck size={14} /> Restore
+        </button>
       </div>
+
+      {/* Action History Table */}
+      {responseActions.length === 0 ? (
+        <div className="text-center py-6 text-gray-600 text-sm">No response actions recorded yet.</div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-xs text-gray-500 uppercase border-b border-white/5">
+                <th className="text-left py-2 px-3">Action</th>
+                <th className="text-left py-2 px-3">Target</th>
+                <th className="text-left py-2 px-3">Status</th>
+                <th className="text-left py-2 px-3">Requested By</th>
+                <th className="text-left py-2 px-3">Reason</th>
+                <th className="text-left py-2 px-3">Time</th>
+                <th className="text-left py-2 px-3">Actions</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-white/5">
+              {responseActions.map(action => (
+                <tr key={action.id} className="hover:bg-white/[0.02] transition-colors">
+                  <td className="py-2.5 px-3">
+                    <span className={`text-xs font-medium ${action.action_type.includes('isolate') || action.action_type.includes('block') || action.action_type.includes('disable') ? 'text-red-400' : 'text-emerald-400'}`}>
+                      {action.action_type.replace(/_/g, ' ')}
+                    </span>
+                  </td>
+                  <td className="py-2.5 px-3 text-gray-400 font-mono text-xs">{action.target_id}</td>
+                  <td className="py-2.5 px-3"><StatusBadge status={action.status} /></td>
+                  <td className="py-2.5 px-3 text-gray-400 text-xs">{action.requested_by || 'system'}</td>
+                  <td className="py-2.5 px-3 text-gray-500 text-xs max-w-[200px] truncate">{action.reason || '-'}</td>
+                  <td className="py-2.5 px-3 text-gray-500 text-xs whitespace-nowrap">{action.created_at ? new Date(action.created_at).toLocaleString() : '-'}</td>
+                  <td className="py-2.5 px-3">
+                    {action.status === 'succeeded' && !action.rollback_of_action_id && (
+                      <button onClick={() => handleRollback(action.id)}
+                        className="text-xs text-cyan-400 hover:text-cyan-300 transition-colors flex items-center gap-1">
+                        <RefreshCw size={10} /> Rollback
+                      </button>
+                    )}
+                    {action.rollback_of_action_id && (
+                      <span className="text-xs text-gray-600 italic">rollback of {action.rollback_of_action_id.slice(0, 12)}…</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ─── Main Control Plane Tab ─────────────────────────────────────────────────
+export default function ControlPlaneTab() {
+  const [dcs, setDcs] = useState([]);
+  const [agents, setAgents] = useState([]);
+  const [actions, setActions] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const fetchAll = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [dcRes, agentRes, actionsRes] = await Promise.all([
+        axios.get(`${API}/api/control/dcs`).catch(() => ({ data: [] })),
+        axios.get(`${API}/api/control/agents`).catch(() => ({ data: [] })),
+        axios.get(`${API}/api/control/actions?limit=100`).catch(() => ({ data: [] })),
+      ]);
+      setDcs(dcRes.data);
+      setAgents(agentRes.data);
+      setActions(actionsRes.data);
+    } catch (e) {}
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { fetchAll(); }, [fetchAll]);
+
+  // Auto-refresh every 10 seconds
+  useEffect(() => {
+    const interval = setInterval(fetchAll, 10000);
+    return () => clearInterval(interval);
+  }, [fetchAll]);
+
+  return (
+    <div className="space-y-6">
+      {/* Header */}
+      <div>
+        <h2 className="text-2xl font-bold text-gray-100 flex items-center gap-3">
+          <Shield size={24} className="text-cyan-400" />
+          Control Plane
+        </h2>
+        <p className="text-sm text-gray-500 mt-1">
+          Manage domain controllers, agents, and active response
+        </p>
+      </div>
+
+      {/* Pending DC Warning */}
+      {dcs.some(d => d.approval_status === 'pending') && (
+        <div className="flex items-center gap-3 p-4 rounded-xl border border-amber-500/30 bg-amber-500/5">
+          <AlertTriangle size={18} className="text-amber-400 shrink-0" />
+          <span className="text-sm text-amber-300">
+            {dcs.filter(d => d.approval_status === 'pending').length} domain controller(s) pending approval. Agents cannot register until a DC is approved.
+          </span>
+        </div>
+      )}
+
+      <DomainControllersSection dcs={dcs} onRefresh={fetchAll} />
+      <AgentInventorySection agents={agents} dcs={dcs} />
+      <ActiveResponseSection actions={actions} agents={agents} dcs={dcs} onRefresh={fetchAll} />
     </div>
   );
 }

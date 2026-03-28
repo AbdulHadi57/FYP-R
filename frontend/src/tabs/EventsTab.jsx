@@ -113,7 +113,7 @@ const EventsTab = ({ apiBaseUrl }) => {
     const getModuleBadge = (source) => {
         switch (source?.toLowerCase()) {
             case 'ja4': return <span className="bg-purple-500/10 text-purple-400 border border-purple-500/20 px-1.5 py-0.5 rounded text-[10px] font-mono tracking-wider">JA4 MODULE</span>;
-            case 'doh': return <span className="bg-pink-500/10 text-pink-400 border border-pink-500/20 px-1.5 py-0.5 rounded text-[10px] font-mono tracking-wider">DoH MODULE</span>;
+
             case 'apt': return <span className="bg-red-500/10 text-red-400 border border-red-500/20 px-1.5 py-0.5 rounded text-[10px] font-mono tracking-wider">APT MODULE</span>;
             case 'system': return <span className="bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 px-1.5 py-0.5 rounded text-[10px] font-mono tracking-wider">SYSTEM LOG</span>;
             default: return <span className="bg-gray-700/30 text-gray-400 border border-gray-600/30 px-1.5 py-0.5 rounded text-[10px] font-mono tracking-wider">GENERAL</span>;
@@ -161,7 +161,7 @@ const EventsTab = ({ apiBaseUrl }) => {
                             >
                                 <option value="all">All Modules</option>
                                 <option value="ja4">JA4 Fingerprinting</option>
-                                <option value="doh">DNS over HTTPS</option>
+
                                 <option value="apt">APT Detection</option>
                             </select>
                             <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500 group-hover:text-cyan-400 transition-colors pointer-events-none" />

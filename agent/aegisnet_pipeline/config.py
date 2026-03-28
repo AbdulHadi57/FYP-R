@@ -11,7 +11,6 @@ class PipelineConfig:
 
     interface: Optional[str] = None
     database_path: Path = Path("data/aegisnet_live.db")
-    database_path: Path = Path("data/aegisnet_live.db")
     server_url: str = "http://localhost:8000"
     control_enabled: bool = True
     domain_fqdn: Optional[str] = None

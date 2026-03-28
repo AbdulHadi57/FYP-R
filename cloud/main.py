@@ -9,13 +9,16 @@ from database import get_db_connection
 from models import Flow, Stats, TimelinePoint, FlowDetail, ModuleStats, ForensicsStats, ActionableEvent, FeatureIngestRequest, ResolutionRequest, IngestRequest, IngestModuleResult
 from control_plane import router as control_plane_router
 
+import os
+
 app = FastAPI(title="AegisNet API")
 app.include_router(control_plane_router)
 
 # Enable CORS for React frontend
+_cors_origins = os.getenv("AEGIS_CORS_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with specific origin
+    allow_origins=[o.strip() for o in _cors_origins],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
