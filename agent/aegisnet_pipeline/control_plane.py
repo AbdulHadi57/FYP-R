@@ -52,6 +52,7 @@ class NodeControlClient:
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._ws_thread: Optional[threading.Thread] = None
         self._websockets_module = self._load_websockets_module()
+        self._ws_poll_fallback_logged = False
 
     def _load_websockets_module(self):
         try:
@@ -582,6 +583,7 @@ class NodeControlClient:
             ws_url = self._to_ws_url(f"{ws_path}?token={self.auth_token}")
             try:
                 async with self._websockets_module.connect(ws_url, ping_interval=20, ping_timeout=20) as websocket:
+                    self._ws_poll_fallback_logged = False
                     await websocket.send(
                         json.dumps({"type": "hello", "node_id": self.node_id, "node_type": self.config.node_type})
                     )
@@ -599,11 +601,13 @@ class NodeControlClient:
                 exc_text = str(exc)
                 if "404" in exc_text and len(ws_paths) > 1:
                     ws_index = (ws_index + 1) % len(ws_paths)
-                    self.logger.warning(
-                        "Control websocket path returned 404 (%s). Retrying alternate path %s in 5s...",
-                        exc,
-                        ws_paths[ws_index],
-                    )
+                    if not self._ws_poll_fallback_logged:
+                        self.logger.warning(
+                            "Control websocket path returned 404 (%s). Retrying alternate path %s in 5s and using HTTP polling fallback.",
+                            exc,
+                            ws_paths[ws_index],
+                        )
+                        self._ws_poll_fallback_logged = True
                 else:
                     self.logger.warning("Control websocket disconnected (%s). Reconnecting in 5s...", exc)
 
