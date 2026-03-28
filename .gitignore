@@ -1,0 +1,34 @@
+*.pkl
+__pycache__/
+node_modules/
+
+# Environment and secret files
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*secrets*.json
+*credentials*.json
+id_rsa
+id_ed25519
+
+# Python caches
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+venv/
+
+# Runtime artifacts
+*.db
+*.db-shm
+*.db-wal
+*.log
+cloud/data/
+data/

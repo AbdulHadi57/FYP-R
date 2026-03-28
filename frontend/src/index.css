@@ -1,0 +1,93 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  @apply bg-gradient-to-br from-indigo-950 via-slate-900 to-black text-gray-300 min-h-screen selection:bg-primary selection:text-black;
+}
+
+.card {
+  @apply bg-black/20 backdrop-blur-xl border border-white/10 rounded-lg p-4 shadow-2xl flex flex-col hover:border-white/20 transition-all duration-300;
+}
+
+.btn {
+  @apply px-4 py-2 rounded bg-primary text-black font-bold hover:opacity-90 transition-opacity;
+}
+
+/* Custom Scrollbar Global Styles */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #050505;
+  border-left: 1px solid #1a1a1a;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #333;
+  border-radius: 4px;
+  border: 1px solid #050505;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #00e0ff;
+  box-shadow: 0 0 10px rgba(0, 224, 255, 0.5);
+}
+
+/* Custom Scrollbar for Firefox */
+html {
+  scrollbar-width: thin;
+  scrollbar-color: #333 #050505;
+}
+
+@keyframes pulse-glow {
+
+  0%,
+  100% {
+    filter: drop-shadow(0 0 2px rgba(6, 182, 212, 0.5));
+    opacity: 0.9;
+  }
+
+  50% {
+    filter: drop-shadow(0 0 10px rgba(6, 182, 212, 1));
+    opacity: 1;
+  }
+}
+
+.animate-pulse-glow {
+  animation: pulse-glow 3s infinite cubic-bezier(0.4, 0, 0.6, 1);
+}
+
+.logo-glow-intense {
+  filter: drop-shadow(0 0 15px rgba(0, 255, 255, 1)) drop-shadow(0 0 30px rgba(6, 182, 212, 0.6));
+}
+
+@keyframes orbit {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes orbit {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-orbit-slow {
+  animation: orbit 12s linear infinite;
+}
+
+.animate-orbit-fast {
+  animation: orbit 3s linear infinite;
+}
