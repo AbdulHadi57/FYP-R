@@ -6,6 +6,5 @@ joblib
 requests
 cryptography
 websockets
-flask
 pywinrm
 paramiko

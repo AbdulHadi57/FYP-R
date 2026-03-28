@@ -32,8 +32,6 @@ class ControlPlaneConfig:
     heartbeat_interval: int = 15
     capabilities: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
-    response_webhook_url: Optional[str] = None
-    webhook_secret: Optional[str] = None
     ad_admin_user: Optional[str] = None
     ad_admin_pass: Optional[str] = None
     dc_ip: Optional[str] = None
@@ -431,29 +429,7 @@ class NodeControlClient:
 
     def _execute_dc_action(self, action_type: str, payload: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
         if action_type in {"isolate_host", "restore_host"}:
-            webhook_url = self.config.response_webhook_url or payload.get("webhook_url")
             target_ip = payload.get("target_ip") or payload.get("ip")
-
-            # Optional webhook compatibility path. If no webhook URL is configured,
-            # execute response actions directly inside the DC runner process.
-            if webhook_url:
-                mapped_action = "isolate" if action_type == "isolate_host" else "restore"
-                headers = {}
-                secret = self.config.webhook_secret or os.getenv("AEGIS_WEBHOOK_SECRET", "").strip()
-                if secret:
-                    headers["X-Webhook-Secret"] = secret
-                try:
-                    resp = requests.post(
-                        webhook_url,
-                        json={"target_ip": target_ip, "action": mapped_action},
-                        headers=headers,
-                        timeout=30,
-                    )
-                    body = resp.json() if resp.content else {}
-                    ok = resp.status_code < 400 and body.get("status") in {"success", "skipped"}
-                    return ("succeeded" if ok else "failed", {"status_code": resp.status_code, "body": body})
-                except Exception as exc:
-                    return "failed", {"message": f"Webhook request failed: {exc}"}
 
             if not target_ip:
                 return "failed", {"message": "Missing payload.target_ip"}
