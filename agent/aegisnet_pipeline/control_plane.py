@@ -187,6 +187,34 @@ class NodeControlClient:
         except Exception as exc:
             self.logger.error("Failed to report action %s status: %s", action_id, exc)
 
+    def _process_action(self, action: Dict[str, Any]) -> None:
+        action_id = action.get("id")
+        if not action_id:
+            return
+        self._report_action_status(action_id, "running", {"message": "Action execution started"})
+        status, result = self._execute_action(action)
+        self._report_action_status(action_id, status, result)
+
+    def _poll_next_action_once(self) -> None:
+        if not self.node_id or not self.auth_token:
+            return
+        try:
+            resp = requests.get(
+                f"{self.base_url}/api/control/actions/next/{self.config.node_type}/{self.node_id}",
+                params={"token": self.auth_token},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                action = (resp.json() or {}).get("action")
+                if action:
+                    self._process_action(action)
+                return
+
+            # Keep this warning concise to avoid noisy logs on transient backend conditions.
+            self.logger.warning("Action poll failed: %s %s", resp.status_code, resp.text)
+        except Exception as exc:
+            self.logger.warning("Action poll request failed: %s", exc)
+
     def _run_command(self, cmd: list[str], timeout: int = 20) -> Dict[str, Any]:
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -562,12 +590,7 @@ class NodeControlClient:
                         msg = json.loads(raw)
                         if msg.get("type") == "action":
                             action = msg.get("payload", {})
-                            action_id = action.get("id")
-                            if not action_id:
-                                continue
-                            self._report_action_status(action_id, "running", {"message": "Action execution started"})
-                            status, result = self._execute_action(action)
-                            self._report_action_status(action_id, status, result)
+                            self._process_action(action)
                         elif msg.get("type") == "pong":
                             continue
             except asyncio.TimeoutError:
@@ -583,6 +606,9 @@ class NodeControlClient:
                     )
                 else:
                     self.logger.warning("Control websocket disconnected (%s). Reconnecting in 5s...", exc)
+
+                # Fallback mode: pull queued actions over HTTP when WS is unavailable.
+                self._poll_next_action_once()
                 await asyncio.sleep(5)
 
     def _ws_thread_main(self) -> None:
