@@ -97,7 +97,12 @@ class NodeControlClient:
         try:
             resp = requests.post(f"{self.base_url}{endpoint}", json=self._register_payload(), timeout=10)
             if resp.status_code != 200:
-                self.logger.error("Registration failed: %s %s", resp.status_code, resp.text)
+                detail = resp.text
+                try:
+                    detail = resp.json().get("detail", detail)
+                except Exception:
+                    pass
+                self.logger.error("Registration failed: %s %s", resp.status_code, detail)
                 return False
             data = resp.json()
             self.node_id = data["node_id"]
@@ -110,10 +115,10 @@ class NodeControlClient:
             self.logger.error("Registration error: %s", exc)
             return False
 
-    def _heartbeat_payload(self) -> Dict[str, Any]:
+    def _heartbeat_payload(self, status: str = "online") -> Dict[str, Any]:
         return {
             "auth_token": self.auth_token,
-            "status": "online",
+            "status": status,
             "payload": {
                 "timestamp": datetime.now(UTC).isoformat(),
                 "node_type": self.config.node_type,
@@ -122,19 +127,24 @@ class NodeControlClient:
             },
         }
 
-    def _heartbeat_loop(self) -> None:
+    def _send_heartbeat(self, status: str) -> None:
+        if not self.node_id or not self.auth_token:
+            return
         endpoint = (
             f"/api/control/heartbeat/agent/{self.node_id}"
             if self.config.node_type == "agent"
             else f"/api/control/heartbeat/dc/{self.node_id}"
         )
+        requests.post(
+            f"{self.base_url}{endpoint}",
+            json=self._heartbeat_payload(status=status),
+            timeout=10,
+        )
+
+    def _heartbeat_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
-                requests.post(
-                    f"{self.base_url}{endpoint}",
-                    json=self._heartbeat_payload(),
-                    timeout=10,
-                )
+                self._send_heartbeat("online")
             except Exception as exc:
                 self.logger.warning("Heartbeat failed: %s", exc)
             self._stop_event.wait(self.config.heartbeat_interval)
@@ -561,3 +571,9 @@ class NodeControlClient:
 
     def stop(self) -> None:
         self._stop_event.set()
+        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+            self._heartbeat_thread.join(timeout=2)
+        try:
+            self._send_heartbeat("offline")
+        except Exception as exc:
+            self.logger.warning("Failed to send offline heartbeat: %s", exc)

@@ -4,7 +4,7 @@ import json
 import os
 import re
 import secrets
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Dict, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Header, WebSocket, WebSocketDisconnect
@@ -29,6 +29,7 @@ from models import (
 
 
 HEARTBEAT_INTERVAL_SECONDS = 15
+OFFLINE_AFTER_SECONDS = HEARTBEAT_INTERVAL_SECONDS * 3
 CONTROL_API_KEY = os.getenv("AEGIS_CONTROL_API_KEY", "").strip()
 
 # Regex for validating IPv4 / IPv6 addresses.
@@ -70,6 +71,50 @@ def _new_id(prefix: str) -> str:
 
 def _new_token() -> str:
     return secrets.token_urlsafe(32)
+
+
+def _parse_iso(ts: Optional[str]) -> Optional[datetime]:
+    if not ts:
+        return None
+    try:
+        parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+    except Exception:
+        return None
+
+
+def _is_stale(last_seen: Optional[str]) -> bool:
+    seen_at = _parse_iso(last_seen)
+    if not seen_at:
+        return True
+    return (datetime.now(UTC) - seen_at) > timedelta(seconds=OFFLINE_AFTER_SECONDS)
+
+
+def _refresh_stale_node_statuses(conn) -> None:
+    now = _now_iso()
+
+    agent_rows = conn.execute("SELECT id, status, last_seen FROM agents").fetchall()
+    stale_agents = [row["id"] for row in agent_rows if row["status"] != "offline" and _is_stale(row["last_seen"])]
+    if stale_agents:
+        placeholders = ",".join("?" for _ in stale_agents)
+        conn.execute(
+            f"UPDATE agents SET status = 'offline', updated_at = ? WHERE id IN ({placeholders})",
+            (now, *stale_agents),
+        )
+
+    dc_rows = conn.execute("SELECT id, status, last_seen FROM domain_controllers").fetchall()
+    stale_dcs = [row["id"] for row in dc_rows if row["status"] != "offline" and _is_stale(row["last_seen"])]
+    if stale_dcs:
+        placeholders = ",".join("?" for _ in stale_dcs)
+        conn.execute(
+            f"UPDATE domain_controllers SET status = 'offline', updated_at = ? WHERE id IN ({placeholders})",
+            (now, *stale_dcs),
+        )
+
+    if stale_agents or stale_dcs:
+        conn.commit()
 
 
 def _validate_ip(ip: str) -> bool:
@@ -323,6 +368,35 @@ def _resolve_dc_for_agent(conn, agent_id: str) -> str:
 def register_agent(request: AgentRegistrationRequest):
     conn = get_db_connection()
     try:
+        if not request.agent_id:
+            existing_agent = conn.execute(
+                """
+                SELECT id
+                FROM agents
+                WHERE LOWER(hostname) = LOWER(?)
+                  AND (
+                    (? = '' AND COALESCE(domain_fqdn, '') = '')
+                    OR (? <> '' AND LOWER(COALESCE(domain_fqdn, '')) = LOWER(?))
+                  )
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (
+                    request.hostname,
+                    (request.domain_fqdn or "").strip(),
+                    (request.domain_fqdn or "").strip(),
+                    (request.domain_fqdn or "").strip(),
+                ),
+            ).fetchone()
+            if existing_agent:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Agent already enrolled as '{existing_agent['id']}'. "
+                        "Reconnect by reusing this agent_id."
+                    ),
+                )
+
         # Validate that the agent can register: must have an approved DC
         dc_hint = (request.dc_hint or "").strip()
         domain = (request.domain_fqdn or "").strip()
@@ -420,6 +494,40 @@ def register_agent(request: AgentRegistrationRequest):
 def register_dc(request: DcRegistrationRequest):
     conn = get_db_connection()
     try:
+        if not request.dc_id:
+            existing_dc = conn.execute(
+                """
+                SELECT id
+                FROM domain_controllers
+                WHERE (
+                    LOWER(hostname) = LOWER(?)
+                    OR (? <> '' AND LOWER(COALESCE(fqdn, '')) = LOWER(?))
+                )
+                  AND (
+                    (? = '' AND COALESCE(domain_fqdn, '') = '')
+                    OR (? <> '' AND LOWER(COALESCE(domain_fqdn, '')) = LOWER(?))
+                  )
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (
+                    request.hostname,
+                    (request.fqdn or "").strip(),
+                    (request.fqdn or "").strip(),
+                    (request.domain_fqdn or "").strip(),
+                    (request.domain_fqdn or "").strip(),
+                    (request.domain_fqdn or "").strip(),
+                ),
+            ).fetchone()
+            if existing_dc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Domain controller already enrolled as '{existing_dc['id']}'. "
+                        "Reconnect by reusing this dc_id."
+                    ),
+                )
+
         node_id = request.dc_id or _new_id("dc")
         token_row = conn.execute("SELECT auth_token, approval_status FROM domain_controllers WHERE id = ?", (node_id,)).fetchone()
         auth_token = token_row["auth_token"] if token_row else _new_token()
@@ -604,6 +712,7 @@ def list_agents(
     _require_operator_key(x_control_key)
     conn = get_db_connection()
     try:
+        _refresh_stale_node_statuses(conn)
         rows = conn.execute(
             "SELECT id, hostname, status, last_seen, domain_fqdn, dc_id FROM agents ORDER BY updated_at DESC LIMIT ?",
             (limit,),
@@ -621,6 +730,7 @@ def list_dcs(
     _require_operator_key(x_control_key)
     conn = get_db_connection()
     try:
+        _refresh_stale_node_statuses(conn)
         rows = conn.execute(
             """SELECT id, hostname, status, last_seen, domain_fqdn, approval_status, approved_by, approved_at, fqdn
                FROM domain_controllers ORDER BY updated_at DESC LIMIT ?""",
