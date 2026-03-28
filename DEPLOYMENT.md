@@ -25,6 +25,9 @@ The backend requires Python 3.10+.
    pip install scikit-learn pandas numpy joblib
    ```
 
+   Note: WebSocket control channel is mandatory. The backend requirements now include
+   `uvicorn[standard]` to ensure WebSocket protocol support is installed.
+
 3. Start the API Server:
    ```bash
    uvicorn main:app --reload --host 0.0.0.0 --port 8000

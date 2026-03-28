@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from collections import Counter
 import json
+import importlib
 import sqlite3
 from detection import DetectionEngine, FeatureRecord
 from database import get_db_connection
@@ -14,6 +15,26 @@ import os
 app = FastAPI(title="AegisNet API")
 app.include_router(control_plane_router)
 app.include_router(control_plane_compat_router)
+
+
+def _detect_ws_backend() -> Optional[str]:
+    for module_name in ("websockets", "wsproto"):
+        try:
+            importlib.import_module(module_name)
+            return module_name
+        except Exception:
+            continue
+    return None
+
+
+@app.on_event("startup")
+def ensure_websocket_backend_available() -> None:
+    ws_backend = _detect_ws_backend()
+    if not ws_backend:
+        raise RuntimeError(
+            "No WebSocket backend is available for Uvicorn/FastAPI. "
+            "Install dependencies with: pip install 'uvicorn[standard]'"
+        )
 
 # Enable CORS for React frontend
 _cors_origins = os.getenv("AEGIS_CORS_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",")
@@ -27,7 +48,7 @@ app.add_middleware(
 
 @app.get("/api/health")
 def health_check():
-    return {"status": "ok"}
+    return {"status": "ok", "ws_backend": _detect_ws_backend() or "missing"}
 
 @app.get("/api/stats", response_model=Stats)
 def get_stats():

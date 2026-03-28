@@ -52,13 +52,13 @@ class NodeControlClient:
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._ws_thread: Optional[threading.Thread] = None
         self._websockets_module = self._load_websockets_module()
-        self._ws_poll_fallback_logged = False
+        self._ws_404_logged_once = False
 
     def _load_websockets_module(self):
         try:
             return importlib.import_module("websockets")
         except Exception:
-            self.logger.warning("Package 'websockets' is not installed; persistent control channel disabled")
+            self.logger.error("Package 'websockets' is required for control channel operation")
             return None
 
     def _register_payload(self) -> Dict[str, Any]:
@@ -195,26 +195,6 @@ class NodeControlClient:
         self._report_action_status(action_id, "running", {"message": "Action execution started"})
         status, result = self._execute_action(action)
         self._report_action_status(action_id, status, result)
-
-    def _poll_next_action_once(self) -> None:
-        if not self.node_id or not self.auth_token:
-            return
-        try:
-            resp = requests.get(
-                f"{self.base_url}/api/control/actions/next/{self.config.node_type}/{self.node_id}",
-                params={"token": self.auth_token},
-                timeout=10,
-            )
-            if resp.status_code == 200:
-                action = (resp.json() or {}).get("action")
-                if action:
-                    self._process_action(action)
-                return
-
-            # Keep this warning concise to avoid noisy logs on transient backend conditions.
-            self.logger.warning("Action poll failed: %s %s", resp.status_code, resp.text)
-        except Exception as exc:
-            self.logger.warning("Action poll request failed: %s", exc)
 
     def _run_command(self, cmd: list[str], timeout: int = 20) -> Dict[str, Any]:
         try:
@@ -583,7 +563,7 @@ class NodeControlClient:
             ws_url = self._to_ws_url(f"{ws_path}?token={self.auth_token}")
             try:
                 async with self._websockets_module.connect(ws_url, ping_interval=20, ping_timeout=20) as websocket:
-                    self._ws_poll_fallback_logged = False
+                    self._ws_404_logged_once = False
                     await websocket.send(
                         json.dumps({"type": "hello", "node_id": self.node_id, "node_type": self.config.node_type})
                     )
@@ -601,35 +581,33 @@ class NodeControlClient:
                 exc_text = str(exc)
                 if "404" in exc_text and len(ws_paths) > 1:
                     ws_index = (ws_index + 1) % len(ws_paths)
-                    if not self._ws_poll_fallback_logged:
+                    if not self._ws_404_logged_once:
                         self.logger.warning(
-                            "Control websocket path returned 404 (%s). Retrying alternate path %s in 5s and using HTTP polling fallback.",
+                            "Control websocket path returned 404 (%s). Retrying alternate path %s in 5s.",
                             exc,
                             ws_paths[ws_index],
                         )
-                        self._ws_poll_fallback_logged = True
+                        self._ws_404_logged_once = True
                 else:
                     self.logger.warning("Control websocket disconnected (%s). Reconnecting in 5s...", exc)
-
-                # Fallback mode: pull queued actions over HTTP when WS is unavailable.
-                self._poll_next_action_once()
                 await asyncio.sleep(5)
 
     def _ws_thread_main(self) -> None:
         asyncio.run(self._ws_loop())
 
     def start(self) -> bool:
+        if self._websockets_module is None:
+            self.logger.error("Cannot start control client without 'websockets' dependency")
+            return False
+
         if not self.register():
             return False
 
         self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self._heartbeat_thread.start()
 
-        if self._websockets_module is not None:
-            self._ws_thread = threading.Thread(target=self._ws_thread_main, daemon=True)
-            self._ws_thread.start()
-        else:
-            self.logger.warning("Running in phase-1-only mode (heartbeats only) until websockets dependency is installed")
+        self._ws_thread = threading.Thread(target=self._ws_thread_main, daemon=True)
+        self._ws_thread.start()
         return True
 
     def stop(self) -> None:

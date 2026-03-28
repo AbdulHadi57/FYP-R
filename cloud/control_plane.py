@@ -1140,47 +1140,6 @@ def get_action(
         conn.close()
 
 
-@router.get("/actions/next/{node_type}/{node_id}")
-def get_next_action_for_node(node_type: str, node_id: str, token: str):
-    if node_type not in {"agent", "dc"}:
-        raise HTTPException(status_code=400, detail="node_type must be 'agent' or 'dc'")
-
-    conn = get_db_connection()
-    try:
-        if not _validate_node_token(conn, node_type, node_id, token):
-            raise HTTPException(status_code=401, detail="Invalid node token")
-
-        if node_type == "dc":
-            dc_row = conn.execute("SELECT approval_status FROM domain_controllers WHERE id = ?", (node_id,)).fetchone()
-            if dc_row and dc_row["approval_status"] != "approved":
-                raise HTTPException(status_code=403, detail="DC not approved")
-
-        row = conn.execute(
-            """
-            SELECT * FROM action_jobs
-            WHERE target_type = ? AND target_id = ? AND status = 'queued'
-            ORDER BY created_at ASC
-            LIMIT 1
-            """,
-            (node_type, node_id),
-        ).fetchone()
-        if not row:
-            return {"action": None}
-
-        now = _now_iso()
-        conn.execute(
-            "UPDATE action_jobs SET status = 'dispatched', dispatched_at = ?, updated_at = ? WHERE id = ?",
-            (now, now, row["id"]),
-        )
-        _audit(conn, row["id"], "dispatched_poll", "control-plane", {"target": node_id}, target_info=node_id)
-        conn.commit()
-
-        refreshed = conn.execute("SELECT * FROM action_jobs WHERE id = ?", (row["id"],)).fetchone()
-        return {"action": dict(refreshed)}
-    finally:
-        conn.close()
-
-
 @router.get("/actions/{action_id}/audit")
 def get_action_audit(
     action_id: str,
