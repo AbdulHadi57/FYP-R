@@ -158,6 +158,7 @@ class ConnectionRegistry:
 
 registry = ConnectionRegistry()
 router = APIRouter(prefix="/api/control", tags=["control-plane"])
+compat_router = APIRouter(tags=["control-plane-compat"])
 
 
 def _node_table(node_type: str) -> str:
@@ -1255,8 +1256,7 @@ def update_action_status(action_id: str, request: ActionStatusUpdateRequest):
 
 # ─── WebSocket Control Channel ───────────────────────────────────────────────
 
-@router.websocket("/ws/control/{node_type}/{node_id}")
-async def control_ws(websocket: WebSocket, node_type: str, node_id: str, token: str):
+async def _control_ws_impl(websocket: WebSocket, node_type: str, node_id: str, token: str):
     if node_type not in {"agent", "dc"}:
         await websocket.close(code=1008)
         return
@@ -1292,3 +1292,18 @@ async def control_ws(websocket: WebSocket, node_type: str, node_id: str, token: 
     except WebSocketDisconnect:
         registry.disconnect(node_type, node_id)
         _mark_node_status(node_type, node_id, "offline")
+
+
+@router.websocket("/ws/control/{node_type}/{node_id}")
+async def control_ws(websocket: WebSocket, node_type: str, node_id: str, token: str):
+    await _control_ws_impl(websocket, node_type, node_id, token)
+
+
+@compat_router.websocket("/control/ws/control/{node_type}/{node_id}")
+async def control_ws_compat_prefixed(websocket: WebSocket, node_type: str, node_id: str, token: str):
+    await _control_ws_impl(websocket, node_type, node_id, token)
+
+
+@compat_router.websocket("/ws/control/{node_type}/{node_id}")
+async def control_ws_compat_short(websocket: WebSocket, node_type: str, node_id: str, token: str):
+    await _control_ws_impl(websocket, node_type, node_id, token)

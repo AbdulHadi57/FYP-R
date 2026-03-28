@@ -7,12 +7,13 @@ import sqlite3
 from detection import DetectionEngine, FeatureRecord
 from database import get_db_connection
 from models import Flow, Stats, TimelinePoint, FlowDetail, ModuleStats, ForensicsStats, ActionableEvent, FeatureIngestRequest, ResolutionRequest, IngestRequest, IngestModuleResult
-from control_plane import router as control_plane_router
+from control_plane import router as control_plane_router, compat_router as control_plane_compat_router
 
 import os
 
 app = FastAPI(title="AegisNet API")
 app.include_router(control_plane_router)
+app.include_router(control_plane_compat_router)
 
 # Enable CORS for React frontend
 _cors_origins = os.getenv("AEGIS_CORS_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",")
