@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import random
+import socket
 from typing import List
+from urllib.parse import urlparse
 
 from aegisnet_capture import AegisNetCapture
 
@@ -20,6 +22,7 @@ class TrafficPipeline:
         self.control_client = None
 
         if self.config.control_enabled:
+            local_ips = self._discover_local_ipv4s(self.config.server_url)
             control_cfg = ControlPlaneConfig(
                 server_url=self.config.server_url,
                 node_type="agent",
@@ -27,7 +30,10 @@ class TrafficPipeline:
                 domain_fqdn=self.config.domain_fqdn,
                 dc_hint=self.config.dc_hint,
                 capabilities={"flow_capture": True, "feature_ingest": True},
-                metadata={"interfaces": [self.config.interface] if self.config.interface else []},
+                metadata={
+                    "interfaces": [self.config.interface] if self.config.interface else [],
+                    "ip_addresses": local_ips,
+                },
             )
             self.control_client = NodeControlClient(control_cfg)
 
@@ -39,14 +45,43 @@ class TrafficPipeline:
             write_to_csv=self.config.write_capture_csv,
         )
 
+    def _discover_local_ipv4s(self, server_url: str) -> List[str]:
+        ips: List[str] = []
+
+        def _add_ip(ip: str) -> None:
+            if ip and "." in ip and not ip.startswith("127.") and ip not in ips:
+                ips.append(ip)
+
+        try:
+            hostname = socket.gethostname()
+            for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+                _add_ip(info[4][0])
+        except Exception:
+            pass
+
+        try:
+            server_host = urlparse(server_url).hostname
+            if server_host:
+                udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    udp_sock.connect((server_host, 80))
+                    _add_ip(udp_sock.getsockname()[0])
+                finally:
+                    udp_sock.close()
+        except Exception:
+            pass
+
+        return ips
+
     def _handle_feature(self, feature_payload: dict) -> None:
         record = FeatureRecord(feature_payload)
         try:
             # Thin Agent: Just forward features to Cloud Storage
-            self.storage.record_flow(record)
-            
-            # Simple logging
-            self.storage.log("INFO", f"Captured flow {record.src_ip} -> {record.dst_ip} (sent to cloud)")
+            flow_id = self.storage.record_flow(record)
+            if flow_id and flow_id > 0:
+                self.storage.log("INFO", f"Captured flow {record.src_ip} -> {record.dst_ip} (cloud flow_id={flow_id})")
+            else:
+                self.storage.log("WARNING", f"Captured flow {record.src_ip} -> {record.dst_ip} but cloud ingest failed")
         except Exception as exc:  # pragma: no cover - defensive log path
             self.storage.log("ERROR", f"Failed to handle feature payload: {exc}")
 
@@ -54,6 +89,11 @@ class TrafficPipeline:
         import time
         iface = self.config.interface or "default-interface"
         self.storage.log("INFO", "Agent Process Started")
+
+        if self.storage.check_backend_health():
+            self.storage.log("INFO", "Cloud backend health check passed")
+        else:
+            self.storage.log("WARNING", "Cloud backend health check failed; telemetry may not reach dashboard")
 
         if self.control_client:
             started = self.control_client.start()

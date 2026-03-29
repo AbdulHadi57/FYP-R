@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -155,6 +156,13 @@ class ConnectionRegistry:
         await ws.send_json({"type": "action", "payload": action})
         return True
 
+    async def send_control_signal(self, node_type: str, node_id: str, signal: dict) -> bool:
+        ws = self.get(node_type, node_id)
+        if not ws:
+            return False
+        await ws.send_json({"type": "control_signal", "payload": signal})
+        return True
+
 
 registry = ConnectionRegistry()
 router = APIRouter(prefix="/api/control", tags=["control-plane"])
@@ -282,6 +290,23 @@ async def _dispatch_pending(node_type: str, node_id: str) -> None:
 
     for row in rows:
         await _dispatch_queued_action(row["id"])
+
+
+async def _notify_node_shutdown(node_type: str, node_id: str, message: str) -> bool:
+    """Ask a connected node process to terminate itself gracefully."""
+    try:
+        return await registry.send_control_signal(
+            node_type,
+            node_id,
+            {
+                "signal": "terminate",
+                "message": message,
+                "requested_at": _now_iso(),
+            },
+        )
+    except Exception:
+        registry.disconnect(node_type, node_id)
+        return False
 
 
 def _mark_node_status(node_type: str, node_id: str, status: str) -> None:
@@ -426,6 +451,7 @@ def register_agent(request: AgentRegistrationRequest):
             )
 
         resolved_dc_id = approved_dc["id"]
+        primary_ip = request.ip_addresses[0] if request.ip_addresses else None
 
         node_id = request.agent_id or _new_id("agt")
         token_row = conn.execute("SELECT auth_token FROM agents WHERE id = ?", (node_id,)).fetchone()
@@ -436,7 +462,7 @@ def register_agent(request: AgentRegistrationRequest):
             """
             INSERT INTO agents (
                 id, hostname, os_type, os_version, agent_version, domain_fqdn, dc_hint, dc_id,
-                interfaces_json, capabilities_json, auth_token, status, last_seen, updated_at
+                primary_ip, ip_addresses_json, interfaces_json, capabilities_json, auth_token, status, last_seen, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'online', ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 hostname=excluded.hostname,
@@ -446,6 +472,8 @@ def register_agent(request: AgentRegistrationRequest):
                 domain_fqdn=excluded.domain_fqdn,
                 dc_hint=excluded.dc_hint,
                 dc_id=excluded.dc_id,
+                primary_ip=excluded.primary_ip,
+                ip_addresses_json=excluded.ip_addresses_json,
                 interfaces_json=excluded.interfaces_json,
                 capabilities_json=excluded.capabilities_json,
                 status='online',
@@ -461,6 +489,8 @@ def register_agent(request: AgentRegistrationRequest):
                 request.domain_fqdn,
                 request.dc_hint,
                 resolved_dc_id,
+                primary_ip,
+                json.dumps(request.ip_addresses),
                 json.dumps(request.interfaces),
                 json.dumps(request.capabilities),
                 auth_token,
@@ -616,7 +646,7 @@ def approve_dc(
 
 
 @router.delete("/dcs/{dc_id}")
-def delete_dc(
+async def delete_dc(
     dc_id: str,
     x_control_key: Optional[str] = Header(default=None, alias="X-Control-Key"),
 ):
@@ -628,13 +658,36 @@ def delete_dc(
         if not row:
             raise HTTPException(status_code=404, detail="Domain controller not found")
 
-        # Find and remove all agents bound to this DC
-        bound_agents = conn.execute(
-            "SELECT agent_id FROM agent_dc_bindings WHERE dc_id = ? AND is_active = 1", (dc_id,)
+        # Find agents bound to this DC and request connected nodes to stop.
+        attached_agents = conn.execute(
+            "SELECT id FROM agents WHERE dc_id = ?",
+            (dc_id,),
         ).fetchall()
+        agent_ids_bound = [agent_row["id"] for agent_row in attached_agents]
+
+        stop_signaled_agents = []
+        for aid in agent_ids_bound:
+            stopped = await _notify_node_shutdown(
+                "agent",
+                aid,
+                f"Domain controller {dc_id} was removed from dashboard. Agent process will stop.",
+            )
+            if stopped:
+                stop_signaled_agents.append(aid)
+
+        dc_stop_signaled = await _notify_node_shutdown(
+            "dc",
+            dc_id,
+            "Domain was removed from dashboard. DC runner process will stop.",
+        )
+
+        # Give connected runners a brief window to display message and exit.
+        if stop_signaled_agents or dc_stop_signaled:
+            await asyncio.sleep(1.0)
+
+        # Remove all agents bound to this DC
         agent_ids_removed = []
-        for agent_row in bound_agents:
-            aid = agent_row["agent_id"]
+        for aid in agent_ids_bound:
             agent_ids_removed.append(aid)
             conn.execute("DELETE FROM agents WHERE id = ?", (aid,))
             conn.execute("DELETE FROM agent_dc_bindings WHERE agent_id = ?", (aid,))
@@ -644,14 +697,67 @@ def delete_dc(
         conn.execute("DELETE FROM domain_controllers WHERE id = ?", (dc_id,))
 
         _audit(conn, dc_id, "dc_deleted", "soc_analyst",
-               {"dc_id": dc_id, "cascaded_agents_removed": agent_ids_removed},
+               {
+                   "dc_id": dc_id,
+                   "cascaded_agents_removed": agent_ids_removed,
+                   "stop_signaled_agents": stop_signaled_agents,
+                   "dc_stop_signaled": dc_stop_signaled,
+               },
                target_info=dc_id)
         conn.commit()
         return {
             "status": "ok",
             "dc_id": dc_id,
             "agents_removed": agent_ids_removed,
+            "stop_signaled_agents": stop_signaled_agents,
+            "dc_stop_signaled": dc_stop_signaled,
             "message": f"DC {dc_id} and {len(agent_ids_removed)} agent(s) removed",
+        }
+    finally:
+        conn.close()
+
+
+@router.delete("/agents/{agent_id}")
+async def delete_agent(
+    agent_id: str,
+    x_control_key: Optional[str] = Header(default=None, alias="X-Control-Key"),
+):
+    """Remove one agent and request the connected process to stop if online."""
+    _require_operator_key(x_control_key)
+    conn = get_db_connection()
+    try:
+        row = conn.execute("SELECT id, dc_id FROM agents WHERE id = ?", (agent_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Agent not found")
+
+        stop_signaled = await _notify_node_shutdown(
+            "agent",
+            agent_id,
+            "Agent was removed from dashboard. Agent process will stop and must be restarted to reconnect.",
+        )
+        if stop_signaled:
+            await asyncio.sleep(1.0)
+
+        conn.execute("DELETE FROM agent_dc_bindings WHERE agent_id = ?", (agent_id,))
+        conn.execute("DELETE FROM agents WHERE id = ?", (agent_id,))
+        _audit(
+            conn,
+            agent_id,
+            "agent_deleted",
+            "soc_analyst",
+            {
+                "agent_id": agent_id,
+                "dc_id": row["dc_id"],
+                "stop_signaled": stop_signaled,
+            },
+            target_info=agent_id,
+        )
+        conn.commit()
+        return {
+            "status": "ok",
+            "agent_id": agent_id,
+            "stop_signaled": stop_signaled,
+            "message": "Agent removed. Re-run agent process to reconnect.",
         }
     finally:
         conn.close()
@@ -715,7 +821,7 @@ def list_agents(
     try:
         _refresh_stale_node_statuses(conn)
         rows = conn.execute(
-            "SELECT id, hostname, status, last_seen, domain_fqdn, dc_id FROM agents ORDER BY updated_at DESC LIMIT ?",
+            "SELECT id, hostname, status, last_seen, domain_fqdn, dc_id, primary_ip FROM agents ORDER BY updated_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
         return [NodeSummary(**dict(row)) for row in rows]

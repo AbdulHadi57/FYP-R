@@ -15,6 +15,7 @@ class PipelineStorage:
         # Ensure it ends with /api/ingest
         base = server_url.rstrip("/")
         self.api_url = f"{base}/api/ingest"
+        self.health_url = f"{base}/api/health"
         self.logger.info(f"Initialized Cloud Storage Client -> {self.api_url}")
 
     def _json_dump(self, payload: dict) -> str:
@@ -45,7 +46,7 @@ class PipelineStorage:
 
         try:
             # Send to Cloud
-            resp = requests.post(self.api_url, json=payload, timeout=2)
+            resp = requests.post(self.api_url, json=payload, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
                 # Return flow ID so orchestrator can log it
@@ -54,8 +55,16 @@ class PipelineStorage:
                 self.logger.error(f"Cloud API Error {resp.status_code}: {resp.text}")
                 return -1
         except Exception as e:
-            self.logger.error(f"Failed to send flow to cloud: {e}")
+            self.logger.error(f"Failed to send flow to cloud ({self.api_url}): {e}")
             return -1
+
+    def check_backend_health(self) -> bool:
+        try:
+            resp = requests.get(self.health_url, timeout=5)
+            return resp.status_code == 200
+        except Exception as exc:
+            self.logger.warning(f"Backend health check failed ({self.health_url}): {exc}")
+            return False
 
     def log(self, level: str, message: str) -> None:
         lvl_map = {"INFO": logging.INFO, "WARNING": logging.WARNING, "ERROR": logging.ERROR, "DEBUG": logging.DEBUG, "CRITICAL": logging.CRITICAL}

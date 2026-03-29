@@ -84,6 +84,8 @@ def _init_schema(conn):
             domain_fqdn TEXT,
             dc_hint TEXT,
             dc_id TEXT,
+            primary_ip TEXT,
+            ip_addresses_json TEXT,
             interfaces_json TEXT,
             capabilities_json TEXT,
             auth_token TEXT NOT NULL,
@@ -243,6 +245,8 @@ def _init_schema(conn):
     _ensure_column(conn, "domain_controllers", "approved_by", "TEXT")
     _ensure_column(conn, "domain_controllers", "approved_at", "TEXT")
     _ensure_column(conn, "agents", "dc_id", "TEXT")
+    _ensure_column(conn, "agents", "primary_ip", "TEXT")
+    _ensure_column(conn, "agents", "ip_addresses_json", "TEXT")
     _ensure_column(conn, "action_audit_logs", "target_info", "TEXT")
     conn.commit()
 

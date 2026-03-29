@@ -139,6 +139,7 @@ class AgentRegistrationRequest(BaseModel):
     domain_fqdn: Optional[str] = None
     dc_hint: Optional[str] = None
     interfaces: List[str] = []
+    ip_addresses: List[str] = []
     capabilities: Dict[str, Any] = {}
 
 
@@ -175,6 +176,7 @@ class NodeSummary(BaseModel):
     last_seen: Optional[str] = None
     domain_fqdn: Optional[str] = None
     dc_id: Optional[str] = None
+    primary_ip: Optional[str] = None
 
 
 class CreateActionRequest(BaseModel):

@@ -103,7 +103,16 @@ class NodeControlClient:
                     detail = resp.json().get("detail", detail)
                 except Exception:
                     pass
-                self.logger.error("Registration failed: %s %s", resp.status_code, detail)
+                if resp.status_code == 403:
+                    domain = (self.config.domain_fqdn or "").strip() or "<no-domain>"
+                    self.logger.error("Registration blocked (403): %s", detail)
+                    self.logger.error(
+                        "Domain approval required. Approve a domain controller for '%s' in dashboard, then restart this %s process.",
+                        domain,
+                        self.config.node_type,
+                    )
+                else:
+                    self.logger.error("Registration failed: %s %s", resp.status_code, detail)
                 return False
             data = resp.json()
             self.node_id = data["node_id"]
@@ -194,7 +203,34 @@ class NodeControlClient:
             return
         self._report_action_status(action_id, "running", {"message": "Action execution started"})
         status, result = self._execute_action(action)
+        terminate_requested = bool(result.pop("_terminate_process", False))
         self._report_action_status(action_id, status, result)
+        if terminate_requested:
+            self._request_local_shutdown(result.get("message", "Termination requested by control-plane action"))
+
+    def _request_local_shutdown(self, message: str) -> None:
+        """Stop loops and terminate the local process after notifying the operator."""
+        self.logger.warning(message)
+        self._stop_event.set()
+
+        def _exit_worker() -> None:
+            try:
+                self._send_heartbeat("offline")
+            except Exception:
+                pass
+            time.sleep(0.3)
+            self.logger.warning("Stopping local %s process by control-plane request.", self.config.node_type)
+            os._exit(0)
+
+        threading.Thread(target=_exit_worker, daemon=True).start()
+
+    def _handle_control_signal(self, payload: Dict[str, Any]) -> None:
+        signal = str(payload.get("signal") or "").strip().lower()
+        if signal == "terminate":
+            msg = str(payload.get("message") or "Termination requested by dashboard")
+            self._request_local_shutdown(msg)
+        else:
+            self.logger.info("Received unsupported control signal: %s", signal or "<empty>")
 
     def _run_command(self, cmd: list[str], timeout: int = 20) -> Dict[str, Any]:
         try:
@@ -516,6 +552,10 @@ class NodeControlClient:
             self.logger.warning("Remote log_message action: %s", msg)
             return "succeeded", {"message": "Logged message", "logged": msg}
 
+        if action_type == "terminate_node":
+            msg = str(payload.get("message") or "Termination requested by control-plane")
+            return "succeeded", {"message": msg, "_terminate_process": True}
+
         if self.config.node_type == "agent":
             if action_type in {"block_ip", "unblock_ip", "quarantine_host", "unquarantine_host"}:
                 return self._execute_agent_action(action_type, payload)
@@ -573,6 +613,10 @@ class NodeControlClient:
                         if msg.get("type") == "action":
                             action = msg.get("payload", {})
                             self._process_action(action)
+                        elif msg.get("type") == "control_signal":
+                            signal_payload = msg.get("payload", {})
+                            if isinstance(signal_payload, dict):
+                                self._handle_control_signal(signal_payload)
                         elif msg.get("type") == "pong":
                             continue
             except asyncio.TimeoutError:

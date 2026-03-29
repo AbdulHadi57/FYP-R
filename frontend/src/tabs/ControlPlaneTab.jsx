@@ -51,10 +51,12 @@ const DomainControllersSection = ({ dcs, onRefresh }) => {
   };
 
   const handleDelete = async (dcId) => {
-    if (!confirm(`Remove DC ${dcId} and ALL its agents? This cannot be undone.`)) return;
+    if (!confirm(`Remove DC ${dcId} and ALL its agents? Connected DC/agent processes will be asked to stop. This cannot be undone.`)) return;
     setDeleting(dcId);
     try {
-      await axios.delete(`${API}/api/control/dcs/${dcId}`);
+      const res = await axios.delete(`${API}/api/control/dcs/${dcId}`);
+      const msg = res?.data?.message || 'Domain controller removed.';
+      alert(msg);
       onRefresh();
     } catch (e) {
       alert(`Failed: ${e.response?.data?.detail || e.message}`);
@@ -126,8 +128,24 @@ const DomainControllersSection = ({ dcs, onRefresh }) => {
 };
 
 // ─── Agent Inventory Section ────────────────────────────────────────────────
-const AgentInventorySection = ({ agents, dcs }) => {
+const AgentInventorySection = ({ agents, dcs, onRefresh }) => {
   const [expandedDc, setExpandedDc] = useState({});
+  const [deletingAgent, setDeletingAgent] = useState(null);
+
+  const handleDeleteAgent = async (agent) => {
+    if (!confirm(`Remove agent ${agent.hostname || agent.id}? Connected client process will be asked to stop.`)) return;
+    setDeletingAgent(agent.id);
+    try {
+      const res = await axios.delete(`${API}/api/control/agents/${agent.id}`);
+      const msg = res?.data?.message || 'Agent removed.';
+      alert(msg);
+      onRefresh();
+    } catch (e) {
+      alert(`Failed: ${e.response?.data?.detail || e.message}`);
+    } finally {
+      setDeletingAgent(null);
+    }
+  };
 
   // Group agents by dc_id
   const grouped = {};
@@ -190,9 +208,18 @@ const AgentInventorySection = ({ agents, dcs }) => {
                           </div>
                         </div>
                         <div className="flex items-center gap-3">
+                          {agent.primary_ip && <span className="text-xs text-cyan-400/80">IP: {agent.primary_ip}</span>}
                           {agent.domain_fqdn && <span className="text-xs text-gray-500">{agent.domain_fqdn}</span>}
                           <StatusBadge status={agent.status} />
                           {agent.last_seen && <span className="text-[10px] text-gray-600">{new Date(agent.last_seen).toLocaleTimeString()}</span>}
+                          <button
+                            onClick={() => handleDeleteAgent(agent)}
+                            disabled={deletingAgent === agent.id}
+                            className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium bg-red-500/10 text-red-400/80 border border-red-500/20 hover:bg-red-500/20 transition-colors disabled:opacity-50"
+                            title="Remove only this agent"
+                          >
+                            <Trash2 size={10} /> {deletingAgent === agent.id ? 'Removing...' : 'Remove'}
+                          </button>
                         </div>
                       </div>
                     ))}
@@ -210,24 +237,37 @@ const AgentInventorySection = ({ agents, dcs }) => {
 // ─── Active Response Section ────────────────────────────────────────────────
 const ActiveResponseSection = ({ actions, agents, dcs, onRefresh }) => {
   const [isolateIp, setIsolateIp] = useState('');
+  const [responseDomain, setResponseDomain] = useState('');
   const [selectedDc, setSelectedDc] = useState('');
   const [actionLoading, setActionLoading] = useState(false);
 
   const approvedDcs = dcs.filter(d => d.approval_status === 'approved');
 
-  const handleAction = async (actionType, targetIp) => {
-    const dcId = selectedDc || (approvedDcs.length > 0 ? approvedDcs[0].id : '');
-    if (!dcId) { alert('No approved DC available'); return; }
+  const handleAction = async (actionType, targetIp, targetDomain) => {
+    if (!targetDomain) { alert('Enter target domain'); return; }
+
+    let dcId = selectedDc;
+    if (!dcId) {
+      const domainNormalized = targetDomain.trim().toLowerCase();
+      const matched = approvedDcs.find(dc => (dc.domain_fqdn || '').trim().toLowerCase() === domainNormalized);
+      dcId = matched?.id || '';
+    }
+
+    if (!dcId) {
+      alert('No approved DC found for the selected domain');
+      return;
+    }
     if (!targetIp) { alert('Enter target IP'); return; }
+
     setActionLoading(true);
     try {
       await axios.post(`${API}/api/control/actions`, {
         target_type: 'dc',
         target_id: dcId,
         action_type: actionType,
-        payload: { target_ip: targetIp },
+        payload: { target_ip: targetIp, domain_fqdn: targetDomain },
         requested_by: 'soc_analyst',
-        reason: `Manual ${actionType} from dashboard`,
+        reason: `Manual ${actionType} from dashboard for ${targetDomain}`,
         require_approval: false,
       });
       setIsolateIp('');
@@ -269,6 +309,13 @@ const ActiveResponseSection = ({ actions, agents, dcs, onRefresh }) => {
           placeholder="Target IP address"
           className="flex-1 bg-black/30 border border-white/10 rounded-lg px-3 py-2 text-sm text-gray-300 placeholder:text-gray-600 focus:border-cyan-500/50 focus:outline-none"
         />
+        <input
+          type="text"
+          value={responseDomain}
+          onChange={(e) => setResponseDomain(e.target.value)}
+          placeholder="Target domain (e.g. aegisnet.local)"
+          className="flex-1 bg-black/30 border border-white/10 rounded-lg px-3 py-2 text-sm text-gray-300 placeholder:text-gray-600 focus:border-cyan-500/50 focus:outline-none"
+        />
         {approvedDcs.length > 1 && (
           <select value={selectedDc} onChange={(e) => setSelectedDc(e.target.value)}
             className="bg-black/30 border border-white/10 rounded-lg px-3 py-2 text-sm text-gray-300 focus:border-cyan-500/50 focus:outline-none">
@@ -276,11 +323,11 @@ const ActiveResponseSection = ({ actions, agents, dcs, onRefresh }) => {
             {approvedDcs.map(dc => <option key={dc.id} value={dc.id}>{dc.hostname || dc.id}</option>)}
           </select>
         )}
-        <button onClick={() => handleAction('isolate_host', isolateIp)} disabled={actionLoading || !isolateIp}
+        <button onClick={() => handleAction('isolate_host', isolateIp, responseDomain)} disabled={actionLoading || !isolateIp || !responseDomain}
           className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium bg-red-500/20 text-red-400 border border-red-500/30 hover:bg-red-500/30 transition-colors disabled:opacity-40">
           <ShieldOff size={14} /> Isolate
         </button>
-        <button onClick={() => handleAction('restore_host', isolateIp)} disabled={actionLoading || !isolateIp}
+        <button onClick={() => handleAction('restore_host', isolateIp, responseDomain)} disabled={actionLoading || !isolateIp || !responseDomain}
           className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/30 transition-colors disabled:opacity-40">
           <ShieldCheck size={14} /> Restore
         </button>
@@ -391,7 +438,7 @@ export default function ControlPlaneTab() {
       )}
 
       <DomainControllersSection dcs={dcs} onRefresh={fetchAll} />
-      <AgentInventorySection agents={agents} dcs={dcs} />
+      <AgentInventorySection agents={agents} dcs={dcs} onRefresh={fetchAll} />
       <ActiveResponseSection actions={actions} agents={agents} dcs={dcs} onRefresh={fetchAll} />
     </div>
   );
