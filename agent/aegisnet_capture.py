@@ -669,8 +669,7 @@ class AegisNetCapture:
     def calculate_features(self, flow):
         """Calculate features for a single flow"""
         packets = flow['packet_data']
-        if len(packets) < 2:
-            # print(f"[DEBUG] Flow {flow['key']} has only {len(packets)} packets, skipping")
+        if len(packets) < 1:
             return None
             
         src_ip, dst_ip, src_port, dst_port, protocol = flow['key']
@@ -1069,6 +1068,9 @@ class AegisNetCapture:
                     entry_count += 1
                     
                 except queue.Empty:
+                    continue
+                except Exception as flow_error:
+                    self.logger.error(f"Flow processing error: {flow_error}")
                     continue
         finally:
             # Close file when done
