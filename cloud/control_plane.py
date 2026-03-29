@@ -463,7 +463,7 @@ def register_agent(request: AgentRegistrationRequest):
             INSERT INTO agents (
                 id, hostname, os_type, os_version, agent_version, domain_fqdn, dc_hint, dc_id,
                 primary_ip, ip_addresses_json, interfaces_json, capabilities_json, auth_token, status, last_seen, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'online', ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'online', ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 hostname=excluded.hostname,
                 os_type=excluded.os_type,
