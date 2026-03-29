@@ -242,6 +242,10 @@ const ActiveResponseSection = ({ actions, agents, dcs, onRefresh }) => {
   const [actionLoading, setActionLoading] = useState(false);
 
   const approvedDcs = dcs.filter(d => d.approval_status === 'approved');
+  const inverseActionMap = {
+    isolate_host: 'restore_host',
+    restore_host: 'isolate_host',
+  };
 
   const handleAction = async (actionType, targetIp, targetDomain) => {
     if (!targetDomain) { alert('Enter target domain'); return; }
@@ -279,15 +283,40 @@ const ActiveResponseSection = ({ actions, agents, dcs, onRefresh }) => {
     }
   };
 
-  const handleRollback = async (actionId) => {
+  const handleRollback = async (action) => {
+    const inverseType = inverseActionMap[action.action_type];
+    if (!inverseType) {
+      alert('Rollback is only supported for isolate/restore actions');
+      return;
+    }
+
+    const payload = action.payload || {};
+    const targetIp = String(payload.target_ip || payload.ip || '').trim();
+    const reasonDomainMatch = String(action.reason || '').match(/for\s+([a-zA-Z0-9.-]+)\s*$/i);
+    const domainFromReason = reasonDomainMatch ? reasonDomainMatch[1] : '';
+    const targetDomain = String(payload.domain_fqdn || domainFromReason || responseDomain || '').trim();
+
+    if (!targetIp || !targetDomain) {
+      alert('Rollback requires target IP and domain. Run manual action once with IP+domain or enter domain above.');
+      return;
+    }
+
     try {
-      await axios.post(`${API}/api/control/actions/${actionId}/rollback`, {
+      setActionLoading(true);
+      await axios.post(`${API}/api/control/actions`, {
+        target_type: 'dc',
+        target_id: action.target_id,
+        action_type: inverseType,
+        payload: { target_ip: targetIp, domain_fqdn: targetDomain },
         requested_by: 'soc_analyst',
-        reason: 'Manual restore from dashboard',
+        reason: `Manual ${inverseType} from dashboard for ${targetDomain} (rollback of ${action.id})`,
+        require_approval: false,
       });
       onRefresh();
     } catch (e) {
       alert(`Failed: ${e.response?.data?.detail || e.message}`);
+    } finally {
+      setActionLoading(false);
     }
   };
 
@@ -364,8 +393,9 @@ const ActiveResponseSection = ({ actions, agents, dcs, onRefresh }) => {
                   <td className="py-2.5 px-3 text-gray-500 text-xs max-w-[200px] truncate">{action.reason || '-'}</td>
                   <td className="py-2.5 px-3 text-gray-500 text-xs whitespace-nowrap">{action.created_at ? new Date(action.created_at).toLocaleString() : '-'}</td>
                   <td className="py-2.5 px-3">
-                    {action.status === 'succeeded' && !action.rollback_of_action_id && (
-                      <button onClick={() => handleRollback(action.id)}
+                    {action.status === 'succeeded' && inverseActionMap[action.action_type] && (
+                      <button onClick={() => handleRollback(action)}
+                        disabled={actionLoading}
                         className="text-xs text-cyan-400 hover:text-cyan-300 transition-colors flex items-center gap-1">
                         <RefreshCw size={10} /> Rollback
                       </button>

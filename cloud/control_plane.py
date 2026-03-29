@@ -215,11 +215,17 @@ def _build_rollback(action_policy: dict, payload: dict) -> tuple[Optional[str], 
 
 
 def _action_row_to_response(row) -> ActionJobResponse:
+    try:
+        payload = json.loads(row["payload_json"] or "{}")
+    except Exception:
+        payload = {}
+
     return ActionJobResponse(
         id=row["id"],
         target_type=row["target_type"],
         target_id=row["target_id"],
         action_type=row["action_type"],
+        payload=payload,
         status=row["status"],
         approval_required=bool(row["approval_required"]),
         approval_status=row["approval_status"] or "not_required",

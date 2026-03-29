@@ -211,6 +211,7 @@ class ActionJobResponse(BaseModel):
     target_type: str
     target_id: str
     action_type: str
+    payload: Dict[str, Any] = {}
     status: str
     approval_required: bool = False
     approval_status: str = "not_required"
