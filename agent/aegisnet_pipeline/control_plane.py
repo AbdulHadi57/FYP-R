@@ -277,6 +277,18 @@ class NodeControlClient:
         dc_ip = self.config.dc_ip or os.getenv("AEGIS_DC_IP")
         return admin_user, admin_pass, dc_ip
 
+    def _discover_source_ip_for_target(self, target_ip: str) -> Optional[str]:
+        """Best-effort local source IP that would be used to reach target_ip."""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.connect((target_ip, 80))
+                src_ip = sock.getsockname()[0]
+            if src_ip and "." in src_ip and not src_ip.startswith("127."):
+                return src_ip
+        except Exception:
+            return None
+        return None
+
     def _direct_isolate_windows(self, target_ip: str, admin_user: str, admin_pass: str, dc_ip: Optional[str]) -> tuple[str, Dict[str, Any]]:
         try:
             import winrm  # Lazy import so runner can still operate without this dependency until needed.
@@ -420,6 +432,17 @@ class NodeControlClient:
                 "message": (
                     "Missing AD admin credentials for direct host response. "
                     "Provide --admin-user/--admin-pass or set AEGIS_ADMIN_USER/AEGIS_ADMIN_PASS."
+                )
+            }
+
+        if not dc_ip:
+            dc_ip = self._discover_source_ip_for_target(target_ip)
+
+        if action_type == "isolate_host" and not dc_ip:
+            return "failed", {
+                "message": (
+                    "Cannot isolate host safely without a management return path. "
+                    "Set AEGIS_DC_IP or ensure DC source IP can be auto-detected."
                 )
             }
 
