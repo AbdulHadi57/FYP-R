@@ -325,35 +325,29 @@ class NodeControlClient:
         except Exception as exc:
             return "failed", {"message": f"pywinrm is required for windows isolate/restore: {exc}"}
 
-        last_error = None
-        for attempt in range(1, 6):
-            try:
-                session = winrm.Session(f"http://{target_ip}:5985/wsman", auth=(admin_user, admin_pass), transport="ntlm")
-                check_result = session.run_ps("Get-NetFirewallRule -DisplayName 'AegisNet-Forensic-In' -ErrorAction SilentlyContinue")
-                if not check_result.std_out:
-                    return "succeeded", {"message": "restore skipped; host is not currently isolated"}
+        try:
+            session = winrm.Session(f"http://{target_ip}:5985/wsman", auth=(admin_user, admin_pass), transport="ntlm")
+            check_result = session.run_ps("Get-NetFirewallRule -DisplayName 'AegisNet-Forensic-In' -ErrorAction SilentlyContinue")
+            if not check_result.std_out:
+                return "succeeded", {"message": "restore skipped; host is not currently isolated"}
 
-                ps_script = """
-                Remove-NetFirewallRule -DisplayName 'AegisNet-Forensic-In' -ErrorAction SilentlyContinue
-                Remove-NetFirewallRule -DisplayName 'AegisNet-Forensic-Out' -ErrorAction SilentlyContinue
-                Set-NetFirewallProfile -Profile Domain,Public,Private -DefaultInboundAction Block -DefaultOutboundAction Allow
-                """
-                result = session.run_ps(ps_script)
-                ok = result.status_code == 0
-                return (
-                    "succeeded" if ok else "failed",
-                    {
-                        "status_code": result.status_code,
-                        "stdout": (result.std_out or b"").decode("utf-8", errors="ignore").strip(),
-                        "stderr": (result.std_err or b"").decode("utf-8", errors="ignore").strip(),
-                    },
-                )
-            except Exception as exc:
-                last_error = exc
-                if attempt < 5:
-                    time.sleep(3)
-
-        return "failed", {"message": f"Windows restore failed after retries: {last_error}"}
+            ps_script = """
+            Remove-NetFirewallRule -DisplayName 'AegisNet-Forensic-In' -ErrorAction SilentlyContinue
+            Remove-NetFirewallRule -DisplayName 'AegisNet-Forensic-Out' -ErrorAction SilentlyContinue
+            Set-NetFirewallProfile -Profile Domain,Public,Private -DefaultInboundAction Block -DefaultOutboundAction Allow
+            """
+            result = session.run_ps(ps_script)
+            ok = result.status_code == 0
+            return (
+                "succeeded" if ok else "failed",
+                {
+                    "status_code": result.status_code,
+                    "stdout": (result.std_out or b"").decode("utf-8", errors="ignore").strip(),
+                    "stderr": (result.std_err or b"").decode("utf-8", errors="ignore").strip(),
+                },
+            )
+        except Exception as exc:
+            return "failed", {"message": f"Windows restore failed: {exc}"}
 
     def _direct_isolate_linux(self, target_ip: str, admin_user: str, admin_pass: str, dc_ip: Optional[str]) -> tuple[str, Dict[str, Any]]:
         try:
@@ -393,29 +387,11 @@ class NodeControlClient:
         except Exception as exc:
             return "failed", {"message": f"paramiko is required for linux isolate/restore: {exc}"}
 
-        ssh = None
-        last_error = None
-        for attempt in range(1, 6):
-            try:
-                ssh = paramiko.SSHClient()
-                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                ssh.connect(hostname=target_ip, username=admin_user, password=admin_pass, timeout=10)
-                break
-            except Exception as exc:
-                last_error = exc
-                if ssh:
-                    try:
-                        ssh.close()
-                    except Exception:
-                        pass
-                    ssh = None
-                if attempt < 5:
-                    time.sleep(3)
-
-        if not ssh:
-            return "failed", {"message": f"Linux restore failed after retries: {last_error}"}
-
         try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(hostname=target_ip, username=admin_user, password=admin_pass, timeout=10)
+
             _, stdout_check, _ = ssh.exec_command("sudo iptables -S | grep 'AegisNet-Isolate-In'")
             has_rule = stdout_check.read().decode("utf-8", errors="ignore").strip()
             if not has_rule:
@@ -441,10 +417,6 @@ class NodeControlClient:
             ok = stderr_text == ""
             return "succeeded" if ok else "failed", {"stdout": stdout_text, "stderr": stderr_text}
         except Exception as exc:
-            try:
-                ssh.close()
-            except Exception:
-                pass
             return "failed", {"message": f"Linux restore failed: {exc}"}
 
     def _execute_direct_dc_host_response(self, action_type: str, payload: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
